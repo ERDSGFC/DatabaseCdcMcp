@@ -1,0 +1,97 @@
+# Database CDC MCP 执行计划
+
+## 1. 目标
+
+构建一个面向桌面用户的本地 MCP Server。第一版仅支持 MySQL，在指定的一段时间内监听启动后产生的 `INSERT`、`UPDATE`、`DELETE` 事件，并允许 MCP 客户端异步拉取结果。
+
+发布物使用 .NET self-contained 模式，最终用户不需要预装 .NET 运行时。
+
+## 2. MVP 范围
+
+- 单进程、单 MySQL 数据源。
+- 使用 MCP `stdio` 传输，由桌面 MCP 客户端按需启动。
+- MySQL 连接信息由环境变量或本地配置提供，不允许通过 MCP tool 传入密码。
+- 支持按数据库、表和操作类型过滤。
+- 每个监听会话设置持续时间和最大事件数。
+- 事件保存在内存中，服务重启后不恢复。
+- 默认从当前 Binlog 末尾开始，只返回监听启动后的变化。
+- 同一时间只运行 1 个监听会话，避免复用同一 MySQL replication `server_id`。
+- 单个会话最长 30 分钟、最多保留 10,000 个事件。
+
+## 3. 非目标
+
+- 不做初始全量快照。
+- 不保证 exactly-once，不提供服务重启后的断点续传。
+- 不实现 Kafka、多节点高可用或分布式订阅。
+- 不处理 DDL 事件。
+- 第一版不提供桌面 GUI，先交付可直接被 MCP 客户端启动的本地可执行程序。
+
+## 4. 技术选型
+
+- .NET 10
+- ModelContextProtocol 2.2.0
+- MySqlCdc 4.0.1
+- MySqlConnector 2.6.2
+- Microsoft.Extensions.Hosting 10.0.11
+- Windows `win-x64` self-contained 发布
+
+## 5. MCP Tools
+
+### `start_mysql_watch`
+
+启动一个监听会话，参数包括数据库、表、操作类型、持续秒数和最大事件数，返回 `watchId`。
+
+### `get_mysql_watch_events`
+
+按 `watchId` 和序号增量读取事件，返回当前状态及下一次读取游标。
+
+### `get_mysql_watch_status`
+
+读取会话状态、已捕获事件数量、开始时间、结束时间和错误信息。
+
+### `stop_mysql_watch`
+
+主动停止监听并释放 Binlog 连接。
+
+## 6. 执行阶段
+
+- [x] 确认桌面优先、短时监听的 MVP 边界。
+- [x] 核实 MCP C# SDK 与 MySqlCdc 包版本和基础 API。
+- [x] 写入执行计划。
+- [x] 搭建 .NET 解决方案、配置和 MCP stdio 服务。
+- [x] 实现监听会话管理、内存事件队列和边界校验。
+- [x] 接入 MySqlCdc 并标准化行事件。
+- [x] 添加单元测试和可替换的变更流抽象。
+- [x] 零警告编译并通过 stdio 验证 MCP 初始化、tools/list 和 tool error。
+- [ ] 还原测试依赖并运行 `dotnet test`（当前外网审批服务拒绝了第二次还原）。
+- [x] 添加 MySQL 本地验证说明和示例 MCP 配置。
+- [ ] 使用真实 MySQL 验证增删改 Binlog（当前机器没有 MySQL 或 Docker）。
+- [x] 生成 Windows self-contained 发布物。
+
+当前发布物位于 `artifacts/win-x64/DatabaseCdcMcp.exe`，约 75 MB。
+
+## 7. 验收标准
+
+1. MCP 客户端可以通过 stdio 启动服务并列出四个 tools。
+2. 启动监听后，对目标表执行增删改能够读取对应事件。
+3. 非目标数据库、表和操作不会进入会话。
+4. 达到持续时间或事件上限后会话自动结束。
+5. 主动停止和客户端取消不会导致后台任务遗留。
+6. 密码不会出现在 MCP tool 参数、返回值或普通日志中。
+7. `dotnet test` 通过，并能生成无需安装 .NET 的 Windows 可执行程序。
+
+## 8. MySQL 前置条件
+
+```ini
+binlog_format=ROW
+binlog_row_image=FULL
+```
+
+监听账号需要：
+
+```sql
+GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'cdc_user'@'%';
+GRANT SELECT ON your_database.* TO 'cdc_user'@'%';
+```
+
+MySqlCdc 4.0.1 当前未完全支持 SSL。第一版仅建议用于可信本地网络或开发环境；远程数据库场景需要在后续版本中替换或加固连接层。

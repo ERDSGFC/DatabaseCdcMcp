@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="src/DatabaseCdcMcp/DatabaseCdcMcp.csproj" />
+  <Project Path="tests/DatabaseCdcMcp.Tests/DatabaseCdcMcp.Tests.csproj" />
+</Solution>
