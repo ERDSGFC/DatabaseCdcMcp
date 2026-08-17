@@ -14,7 +14,7 @@ public sealed class WatchSessionManager
 {
     private const int MaxConcurrentSessions = 1;
     private static readonly TimeSpan MaxDuration = TimeSpan.FromMinutes(30);
-    private const int MaxRetainedEvents = 10_000;
+    private const int MaxRetainedEvents = 100_000;
 
     private readonly ConcurrentDictionary<string, WatchSession> _sessions = new();
     private readonly SemaphoreSlim _sessionSlots = new(MaxConcurrentSessions, MaxConcurrentSessions);
