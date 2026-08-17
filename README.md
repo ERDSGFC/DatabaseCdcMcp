@@ -124,7 +124,7 @@ MySQL 5.7 使用 `REPLICATION SLAVE` 权限名称：
 
 ```sql
 CREATE USER IF NOT EXISTS 'cdc_user'@'%'
-IDENTIFIED BY 'replace-with-a-strong-password';
+IDENTIFIED BY 'asdfjj';
 
 GRANT REPLICATION SLAVE, REPLICATION CLIENT
 ON *.* TO 'cdc_user'@'%';
