@@ -16,7 +16,7 @@
 - 事件保存在内存中，服务重启后不恢复。
 - 默认从当前 Binlog 末尾开始，只返回监听启动后的变化。
 - 同一时间只运行 1 个监听会话，避免复用同一 MySQL replication `server_id`。
-- 单个会话最长 30 分钟、最多保留 10,000 个事件。
+- 单个会话最长 30 分钟、最多保留 100,000 个事件。
 
 ## 3. 非目标
 
@@ -63,7 +63,7 @@
 - [x] 接入 MySqlCdc 并标准化行事件。
 - [x] 添加单元测试和可替换的变更流抽象。
 - [x] 零警告编译并通过 stdio 验证 MCP 初始化、tools/list 和 tool error。
-- [ ] 还原测试依赖并运行 `dotnet test`（当前外网审批服务拒绝了第二次还原）。
+- [x] 还原测试依赖并运行 `dotnet test`。
 - [x] 添加 MySQL 本地验证说明和示例 MCP 配置。
 - [ ] 使用真实 MySQL 验证增删改 Binlog（当前机器没有 MySQL 或 Docker）。
 - [x] 生成 Windows self-contained 发布物。
