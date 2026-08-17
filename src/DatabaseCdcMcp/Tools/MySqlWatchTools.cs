@@ -15,14 +15,17 @@ public static class MySqlWatchTools
         Destructive = false,
         OpenWorld = true,
         UseStructuredContent = true)]
-    [Description("Starts a time-limited watch for new MySQL row changes and returns a watch identifier.")]
+    [Description(
+        "Use this when the user wants to monitor future committed MySQL row changes. " +
+        "Start the watch before the INSERT, UPDATE, or DELETE occurs. It reads only new " +
+        "row-level binlog events, not historical data, and only one watch session can run at a time.")]
     public static StartWatchResponse StartMysqlWatch(
         WatchSessionManager manager,
-        [Description("Database name to watch.")] string database,
-        [Description("Optional table names. Empty means all tables in the database.")] string[]? tables = null,
-        [Description("Optional operations: insert, update, delete. Empty means all operations.")] string[]? operations = null,
-        [Description("Watch duration in seconds, from 1 to 1800. Defaults to 300 seconds.")] int durationSeconds = 300,
-        [Description("Maximum retained events, from 1 to 100000.")] int maxEvents = 1000)
+        [Description("Exact MySQL database name to monitor. The database must already exist and be accessible to the configured user.")] string database,
+        [Description("Optional exact table names to monitor. An empty or omitted array monitors every table in the database.")] string[]? tables = null,
+        [Description("Optional operation filter. Allowed values are insert, update, and delete. An empty or omitted array includes all three operations.")] string[]? operations = null,
+        [Description("How long to collect events, in seconds. Must be between 1 and 1800; defaults to 300 seconds. The watch expires automatically.")] int durationSeconds = 300,
+        [Description("Maximum number of events retained in memory for this watch. Must be between 1 and 100000; older events are not persisted.")] int maxEvents = 1000)
     {
         return Invoke(() => manager.Start(database, tables, operations, durationSeconds, maxEvents));
     }
@@ -35,12 +38,15 @@ public static class MySqlWatchTools
         Idempotent = true,
         OpenWorld = false,
         UseStructuredContent = true)]
-    [Description("Returns events captured by a MySQL watch after the supplied sequence number.")]
+    [Description(
+        "Returns row-change events already captured by a watch. Call this after start_mysql_watch " +
+        "using its watchId, and pass the previous nextSequence as afterSequence for pagination. " +
+        "Events are held in memory only and are removed when the process exits.")]
     public static WatchEventsResponse GetMysqlWatchEvents(
         WatchSessionManager manager,
         [Description("Watch identifier returned by start_mysql_watch.")] string watchId,
-        [Description("Return events with a sequence greater than this value.")] long afterSequence = 0,
-        [Description("Maximum events to return, from 1 to 1000.")] int limit = 100)
+        [Description("Return events whose sequence is greater than this value. Use 0 for the first page, then use the previous response's nextSequence.")] long afterSequence = 0,
+        [Description("Maximum events in this page. Must be between 1 and 1000; defaults to 100.")] int limit = 100)
     {
         return Invoke(() => manager.GetEvents(watchId, afterSequence, limit));
     }
@@ -53,7 +59,7 @@ public static class MySqlWatchTools
         Idempotent = true,
         OpenWorld = false,
         UseStructuredContent = true)]
-    [Description("Returns the state and counters of a MySQL watch.")]
+    [Description("Returns the current state, expiration time, event counters, and any error for a watch. Use this to check whether collection is still running or has completed.")]
     public static WatchStatusResponse GetMysqlWatchStatus(
         WatchSessionManager manager,
         [Description("Watch identifier returned by start_mysql_watch.")] string watchId)
@@ -69,7 +75,7 @@ public static class MySqlWatchTools
         Idempotent = true,
         OpenWorld = false,
         UseStructuredContent = true)]
-    [Description("Returns the database, tables and operations currently being watched.")]
+    [Description("Lists the database, table filter, operation filter, and expiration time for the currently active watch. Use this to discover the active target without a watchId.")]
     public static WatchTargetsResponse GetMysqlWatchTargets(WatchSessionManager manager)
     {
         return manager.GetCurrentTargets();
@@ -83,7 +89,7 @@ public static class MySqlWatchTools
         Idempotent = true,
         OpenWorld = false,
         UseStructuredContent = true)]
-    [Description("Stops an active MySQL watch. Already finished watches remain readable.")]
+    [Description("Stops an active watch early and returns its final status. Events already captured remain readable with get_mysql_watch_events after stopping.")]
     public static WatchStatusResponse StopMysqlWatch(
         WatchSessionManager manager,
         [Description("Watch identifier returned by start_mysql_watch.")] string watchId)
