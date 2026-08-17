@@ -255,7 +255,7 @@ D:\desktop\DatabaseCdcMcp\artifacts\win-x64\DatabaseCdcMcp.exe
 
 在 JSON 中 Windows 反斜杠必须写成 `\\`。`MYSQL_CDC_SERVER_ID` 是复制客户端 ID，同一个 MySQL 实例上不要让多个复制客户端使用相同的 ID。
 
-保存配置后，完全退出并重新打开桌面 MCP 客户端，使它重新启动 MCP Server。连接成功后，客户端应该能发现以下六个工具：
+保存配置后，完全退出并重新打开桌面 MCP 客户端，使它重新启动 MCP Server。连接成功后，客户端应该能发现以下八个工具：
 
 ```text
 start_mysql_watch
@@ -263,6 +263,7 @@ get_mysql_watch_events
 get_mysql_watch_status
 get_mysql_watch_targets
 stop_mysql_watch
+get_mysql_tables
 get_mysql_table_schema
 get_mysql_table_data
 ```
@@ -308,6 +309,7 @@ get_mysql_watch_events
 get_mysql_watch_status
 get_mysql_watch_targets
 stop_mysql_watch
+get_mysql_tables
 get_mysql_table_schema
 get_mysql_table_data
 ```
@@ -542,7 +544,24 @@ COMMIT;
 
 两者都只需要一个参数：`watchId`。
 
-## 8. 查询表结构和数据
+## 8. 查询表、表结构和数据
+
+### `get_mysql_tables`
+
+分页查询指定数据库中的表和视图。可以使用 `tableNamePrefix` 做字面前缀过滤，也可以使用 `tableNameLike` 传入 MySQL `LIKE` 模式；两者不能同时使用。`tableNameLike` 中 `%` 匹配任意长度字符，`_` 匹配单个字符。例如查询 `demo` 中名称包含 `admin` 的表：
+
+```json
+{
+  "database": "demo",
+  "tableNameLike": "%admin%",
+  "limit": 100,
+  "offset": 0
+}
+```
+
+查询 `sys_` 字面前缀时，使用 `tableNamePrefix: "sys_"` 更直接；该参数不会把 `_` 和 `%` 当作通配符。
+
+返回结果包含表名、表类型、存储引擎和注释，以及用于继续分页的 `nextOffset` 和 `hasMore`。
 
 ### `get_mysql_table_schema`
 

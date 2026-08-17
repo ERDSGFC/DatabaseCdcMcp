@@ -10,6 +10,33 @@ namespace DatabaseCdcMcp.Tools;
 public static class MySqlQueryTools
 {
     [McpServerTool(
+        Name = "get_mysql_tables",
+        Title = "Get MySQL tables",
+        ReadOnly = true,
+        Destructive = false,
+        Idempotent = true,
+        OpenWorld = true,
+        UseStructuredContent = true)]
+    [Description("Lists tables and views in a MySQL database. Use tableNamePrefix for a literal prefix or tableNameLike for a MySQL LIKE pattern such as %admin%. The two filters cannot be used together. This tool does not modify data.")]
+    public static Task<MySqlTablesResponse> GetMysqlTables(
+        MySqlQueryService queryService,
+        [Description("Exact MySQL database name whose tables should be listed.")] string database,
+        [Description("Optional literal table-name prefix. Characters such as underscore and percent are matched literally, not as SQL wildcards.")] string? tableNamePrefix = null,
+        [Description("Maximum tables in this page. Must be between 1 and 1000; defaults to 100.")] int limit = 100,
+        [Description("Number of tables to skip before this page. Use the previous response's nextOffset for pagination; defaults to 0.")] long offset = 0,
+        [Description("Optional MySQL LIKE pattern for table names, such as %admin% to match names containing admin. Use this or tableNamePrefix, not both.")] string? tableNameLike = null,
+        CancellationToken cancellationToken = default)
+    {
+        return InvokeAsync(() => queryService.GetTablesAsync(
+            database,
+            tableNamePrefix,
+            limit,
+            offset,
+            tableNameLike,
+            cancellationToken));
+    }
+
+    [McpServerTool(
         Name = "get_mysql_table_schema",
         Title = "Get MySQL table schema",
         ReadOnly = true,

@@ -35,4 +35,49 @@ public sealed class MySqlQueryServiceTests
 
         Assert.Contains("database is required", exception.Message);
     }
+
+    [Fact]
+    public async Task InvalidTableListLimitIsRejectedBeforeOpeningMySql()
+    {
+        var exception = await Assert.ThrowsAsync<MySqlQueryException>(() =>
+            _service.GetTablesAsync("demo", "sys_", limit: 1_001));
+
+        Assert.Contains("limit must be between", exception.Message);
+    }
+
+    [Fact]
+    public async Task NegativeTableListOffsetIsRejectedBeforeOpeningMySql()
+    {
+        var exception = await Assert.ThrowsAsync<MySqlQueryException>(() =>
+            _service.GetTablesAsync("demo", "sys_", limit: 100, offset: -1));
+
+        Assert.Contains("offset must be zero or greater", exception.Message);
+    }
+
+    [Fact]
+    public async Task InvalidTableNamePrefixIsRejectedBeforeOpeningMySql()
+    {
+        var exception = await Assert.ThrowsAsync<MySqlQueryException>(() =>
+            _service.GetTablesAsync("demo", new string('x', 65)));
+
+        Assert.Contains("tableNamePrefix must be no longer", exception.Message);
+    }
+
+    [Fact]
+    public async Task PrefixAndLikeFiltersCannotBeUsedTogether()
+    {
+        var exception = await Assert.ThrowsAsync<MySqlQueryException>(() =>
+            _service.GetTablesAsync("demo", "sys_", tableNameLike: "%admin%"));
+
+        Assert.Contains("cannot be used together", exception.Message);
+    }
+
+    [Fact]
+    public async Task InvalidTableNameLikePatternIsRejectedBeforeOpeningMySql()
+    {
+        var exception = await Assert.ThrowsAsync<MySqlQueryException>(() =>
+            _service.GetTablesAsync("demo", tableNameLike: new string('x', 257)));
+
+        Assert.Contains("tableNameLike must be no longer", exception.Message);
+    }
 }
