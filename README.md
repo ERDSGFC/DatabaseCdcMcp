@@ -88,6 +88,7 @@ SHOW VARIABLES LIKE 'binlog_row_image';
 SHOW VARIABLES LIKE 'expire_logs_days';
 SHOW VARIABLES LIKE 'server_id';
 SHOW MASTER STATUS;
+--SELECT @@global.log_bin, @@global.binlog_format, @@global.binlog_row_image, @@global.expire_logs_days;
 ```
 
 预期结果：
