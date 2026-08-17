@@ -21,7 +21,7 @@ public static class MySqlWatchTools
         [Description("Database name to watch.")] string database,
         [Description("Optional table names. Empty means all tables in the database.")] string[]? tables = null,
         [Description("Optional operations: insert, update, delete. Empty means all operations.")] string[]? operations = null,
-        [Description("Watch duration in seconds, from 1 to 1800.")] int durationSeconds = 60,
+        [Description("Watch duration in seconds, from 1 to 1800. Defaults to 300 seconds.")] int durationSeconds = 300,
         [Description("Maximum retained events, from 1 to 100000.")] int maxEvents = 1000)
     {
         return Invoke(() => manager.Start(database, tables, operations, durationSeconds, maxEvents));

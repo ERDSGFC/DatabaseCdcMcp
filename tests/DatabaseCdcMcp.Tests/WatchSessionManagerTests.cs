@@ -1,6 +1,7 @@
 using DatabaseCdcMcp.Configuration;
 using DatabaseCdcMcp.Domain;
 using DatabaseCdcMcp.MySql;
+using DatabaseCdcMcp.Tools;
 using DatabaseCdcMcp.Watches;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -10,6 +11,17 @@ namespace DatabaseCdcMcp.Tests;
 
 public sealed class WatchSessionManagerTests
 {
+    [Fact]
+    public void StartMysqlWatchDefaultsToFiveMinutes()
+    {
+        var durationParameter = typeof(MySqlWatchTools)
+            .GetMethod(nameof(MySqlWatchTools.StartMysqlWatch))!
+            .GetParameters()
+            .Single(parameter => parameter.Name == "durationSeconds");
+
+        Assert.Equal(300, durationParameter.DefaultValue);
+    }
+
     [Fact]
     public async Task CapturedEventsAreSequencedAndCanBeReadIncrementally()
     {

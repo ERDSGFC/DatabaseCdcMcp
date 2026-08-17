@@ -523,7 +523,7 @@ COMMIT;
 | `database` | 是 | 要监听的数据库名称 |
 | `tables` | 否 | 表名数组；为空表示该数据库的所有表 |
 | `operations` | 否 | `insert`、`update`、`delete`；为空表示全部操作 |
-| `durationSeconds` | 否 | 监听时间，1 到 1800 秒，默认 60 秒 |
+| `durationSeconds` | 否 | 监听时间，1 到 1800 秒，默认 300 秒（5 分钟） |
 | `maxEvents` | 否 | 会话最多保留的事件数，1 到 100000，默认 1000 |
 
 ### `get_mysql_watch_events`
