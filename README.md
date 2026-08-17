@@ -14,7 +14,7 @@
 - 单次监听时间范围为 1 到 1800 秒（最长 30 分钟）。
 - 单个会话最多保留 100000 条事件。
 - 单次读取最多返回 1000 条事件。
-- 当前版本不提供初始全量快照，也不监听 DDL 变化。
+- 监听不会自动提供初始全量快照；如需读取现有数据，可调用表数据查询工具。当前也不监听 DDL 变化。
 
 ## 2. 准备环境
 
@@ -255,14 +255,62 @@ D:\desktop\DatabaseCdcMcp\artifacts\win-x64\DatabaseCdcMcp.exe
 
 在 JSON 中 Windows 反斜杠必须写成 `\\`。`MYSQL_CDC_SERVER_ID` 是复制客户端 ID，同一个 MySQL 实例上不要让多个复制客户端使用相同的 ID。
 
-保存配置后，完全退出并重新打开桌面 MCP 客户端，使它重新启动 MCP Server。连接成功后，客户端应该能发现以下四个工具：
+保存配置后，完全退出并重新打开桌面 MCP 客户端，使它重新启动 MCP Server。连接成功后，客户端应该能发现以下六个工具：
 
 ```text
 start_mysql_watch
 get_mysql_watch_events
 get_mysql_watch_status
 stop_mysql_watch
+get_mysql_table_schema
+get_mysql_table_data
 ```
+
+### 配置 Codex 使用此 MCP
+
+如果使用的是 Codex，可以直接在 Codex 的 MCP 配置中添加这个本地 `stdio` Server。Windows 默认配置文件为：
+
+```text
+%USERPROFILE%\.codex\config.toml
+```
+
+例如当前用户通常对应：
+
+```text
+C:\Users\Administrator\.codex\config.toml
+```
+
+先按照第 4 节发布程序，然后在 `config.toml` 末尾加入：
+
+```toml
+[mcp_servers.database_cdc]
+type = "stdio"
+command = 'D:\desktop\DatabaseCdcMcp\artifacts\win-x64\DatabaseCdcMcp.exe'
+args = []
+startup_timeout_sec = 30
+
+[mcp_servers.database_cdc.env]
+MYSQL_CDC_HOST = "127.0.0.1"
+MYSQL_CDC_PORT = "3306"
+MYSQL_CDC_USER = "cdc_user"
+MYSQL_CDC_PASSWORD = "replace-with-a-strong-password"
+MYSQL_CDC_SERVER_ID = "6174"
+```
+
+将 `command` 改为实际的 `DatabaseCdcMcp.exe` 绝对路径，将账号和密码改为实际值。`MYSQL_CDC_SERVER_ID` 必须与 MySQL 的 `server_id` 不同，例如 MySQL 使用 `server_id=1` 时，MCP 可以使用 `6174`。
+
+保存后完全退出并重新打开 Codex，或创建一个新的 Codex 任务。MCP 工具通常在任务启动时加载，已经运行的任务不会自动出现新工具。连接成功后，应能看到：
+
+```text
+start_mysql_watch
+get_mysql_watch_events
+get_mysql_watch_status
+stop_mysql_watch
+get_mysql_table_schema
+get_mysql_table_data
+```
+
+配置文件中会保存数据库密码明文，请使用权限受限的 CDC 专用账号，并限制配置文件的访问权限。
 
 ### 从源代码启动（开发者可选）
 
@@ -459,7 +507,35 @@ COMMIT;
 
 两者都只需要一个参数：`watchId`。
 
-## 8. 事件字段说明
+## 8. 查询表结构和数据
+
+### `get_mysql_table_schema`
+
+读取指定表的列结构，不会修改数据库。返回每列的名称、数据类型、完整列类型、是否可空、键类型、默认值、额外属性和注释。
+
+```json
+{
+  "database": "demo",
+  "table": "orders"
+}
+```
+
+### `get_mysql_table_data`
+
+读取指定表的行数据，默认返回前 100 行，最多每次返回 1000 行。使用 `offset` 分页；响应中的 `nextOffset` 可直接用于下一次调用。工具只接受数据库名和表名，不接受原始 SQL 或 `WHERE` 子句。
+
+```json
+{
+  "database": "demo",
+  "table": "orders",
+  "limit": 100,
+  "offset": 0
+}
+```
+
+返回结果包含 `columns`、`rows`、`nextOffset` 和 `hasMore`。查询账号需要目标数据库表的 `SELECT` 权限。
+
+## 9. 事件字段说明
 
 - `sequence`：会话内递增序号，用于分页。
 - `eventId`：事件唯一标识，格式为 `watchId:sequence`。
@@ -471,7 +547,7 @@ COMMIT;
 - `binlogFile`、`binlogPosition`：事件在 MySQL Binlog 中的位置。
 - `gtid`：GTID 已启用时的事务标识，否则为空。
 
-## 9. 常见问题
+## 10. 常见问题
 
 ### MCP 客户端看不到工具
 

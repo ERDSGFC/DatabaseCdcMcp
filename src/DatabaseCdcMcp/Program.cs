@@ -16,6 +16,7 @@ builder.Logging.AddConsole(options =>
 
 builder.Services.AddSingleton(MySqlCdcSettings.FromConfiguration(builder.Configuration));
 builder.Services.AddSingleton<IMySqlChangeStreamFactory, MySqlCdcChangeStreamFactory>();
+builder.Services.AddSingleton<MySqlQueryService>();
 builder.Services.AddSingleton<WatchSessionManager>();
 
 builder.Services
