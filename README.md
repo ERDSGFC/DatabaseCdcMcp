@@ -43,8 +43,10 @@ dotnet test --no-build
 ## 发布
 
 ```powershell
-dotnet publish src/DatabaseCdcMcp/DatabaseCdcMcp.csproj -c Release -r win-x64 --self-contained true
+dotnet publish src/DatabaseCdcMcp/DatabaseCdcMcp.csproj -c Release -r win-x64 --self-contained true -o artifacts/win-x64
 ```
+
+发布文件会生成到 `artifacts/win-x64/`，其中的 `DatabaseCdcMcp.exe` 是不需要预装 .NET 的 Windows self-contained 单文件程序。
 
 ## MCP 配置示例
 

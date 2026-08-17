@@ -7,6 +7,9 @@ using Microsoft.Extensions.Logging;
 
 namespace DatabaseCdcMcp.Watches;
 
+/// <summary>
+/// 管理当前 MySQL 监听会话的生命周期和内存事件队列。
+/// </summary>
 public sealed class WatchSessionManager
 {
     private const int MaxConcurrentSessions = 1;
@@ -15,11 +18,19 @@ public sealed class WatchSessionManager
 
     private readonly ConcurrentDictionary<string, WatchSession> _sessions = new();
     private readonly SemaphoreSlim _sessionSlots = new(MaxConcurrentSessions, MaxConcurrentSessions);
+    
     private readonly IMySqlChangeStreamFactory _changeStreamFactory;
     private readonly MySqlCdcSettings _settings;
     private readonly IHostApplicationLifetime _applicationLifetime;
     private readonly ILogger<WatchSessionManager> _logger;
 
+    /// <summary>
+    /// 创建一个对应已配置 MySQL 数据源的监听会话管理器。
+    /// </summary>
+    /// <param name="changeStreamFactory">用于打开 Binlog 数据流的工厂。</param>
+    /// <param name="settings">已读取并校验的 MySQL 连接配置。</param>
+    /// <param name="applicationLifetime">用于在服务关闭时停止监听的 Host 生命周期对象。</param>
+    /// <param name="logger">用于记录后台监听任务异常的日志对象。</param>
     public WatchSessionManager(
         IMySqlChangeStreamFactory changeStreamFactory,
         MySqlCdcSettings settings,
@@ -32,6 +43,15 @@ public sealed class WatchSessionManager
         _logger = logger;
     }
 
+    /// <summary>
+    /// 启动一个有时限和数量上限的监听，并立即返回监听标识。
+    /// </summary>
+    /// <param name="database">要监听的数据库。</param>
+    /// <param name="tables">可选的表过滤条件；为空表示监听所有表。</param>
+    /// <param name="operations">可选的新增、更新和删除操作过滤条件。</param>
+    /// <param name="durationSeconds">监听的最长持续时间。</param>
+    /// <param name="maxEvents">最多保留的事件数量。</param>
+    /// <returns>新创建的监听会话信息。</returns>
     public StartWatchResponse Start(
         string database,
         IEnumerable<string>? tables,
@@ -72,6 +92,9 @@ public sealed class WatchSessionManager
             request.MaxEvents);
     }
 
+    /// <summary>
+    /// 读取指定序号之后的一页事件。
+    /// </summary>
     public WatchEventsResponse GetEvents(string watchId, long afterSequence, int limit)
     {
         var session = GetSession(watchId);
@@ -89,8 +112,14 @@ public sealed class WatchSessionManager
         return session.GetEvents(afterSequence, limit);
     }
 
+    /// <summary>
+    /// 返回监听会话的当前状态和统计信息。
+    /// </summary>
     public WatchStatusResponse GetStatus(string watchId) => GetSession(watchId).GetStatus();
 
+    /// <summary>
+    /// 请求取消活动监听，并返回当前状态。
+    /// </summary>
     public WatchStatusResponse Stop(string watchId)
     {
         var session = GetSession(watchId);
@@ -100,6 +129,8 @@ public sealed class WatchSessionManager
 
     private async Task RunSessionAsync(WatchSession session)
     {
+        // 监听可能因为达到时长、主动停止或 Host 关闭而结束。
+        // 使用链接取消令牌，让 CDC 连接器统一感知这三种情况。
         using var timeoutSource = new CancellationTokenSource(session.Request.Duration);
         using var linkedSource = CancellationTokenSource.CreateLinkedTokenSource(
             session.StopToken,
@@ -126,6 +157,7 @@ public sealed class WatchSessionManager
                 session.Complete("stream_ended");
             }
         }
+        // 将不同的取消原因转换为调用方可见的监听状态。
         catch (OperationCanceledException) when (timeoutSource.IsCancellationRequested)
         {
             session.Complete("duration_elapsed");
@@ -149,6 +181,9 @@ public sealed class WatchSessionManager
         }
     }
 
+    /// <summary>
+    /// 查找监听会话；找不到时抛出面向调用方的校验错误。
+    /// </summary>
     private WatchSession GetSession(string watchId)
     {
         if (string.IsNullOrWhiteSpace(watchId) || !_sessions.TryGetValue(watchId, out var session))
@@ -159,6 +194,9 @@ public sealed class WatchSessionManager
         return session;
     }
 
+    /// <summary>
+    /// 在后台任务启动前校验并标准化工具参数。
+    /// </summary>
     private static MySqlWatchRequest NormalizeRequest(
         string database,
         IEnumerable<string>? tables,

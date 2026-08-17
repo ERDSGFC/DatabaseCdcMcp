@@ -9,21 +9,38 @@ using MySqlConnector;
 
 namespace DatabaseCdcMcp.MySql;
 
+/// <summary>
+/// 创建 MySQL Binlog 数据流，并将行事件转换为应用程序的数据库变化模型。
+/// </summary>
+/// <param name="settings">源 MySQL 服务器的连接和复制配置。</param>
 public sealed class MySqlCdcChangeStreamFactory(MySqlCdcSettings settings)
     : IMySqlChangeStreamFactory
 {
+    /// <summary>
+    /// 从当前 MySQL Binlog 末尾读取已提交的行变化。
+    /// </summary>
+    /// <param name="request">数据库、表、操作类型和监听会话过滤条件。</param>
+    /// <param name="cancellationToken">监听结束时用于停止复制数据流。</param>
+    /// <returns>标准化后的新增、更新和删除事件流。</returns>
     public async IAsyncEnumerable<DatabaseChange> ReadChangesAsync(
         MySqlWatchRequest request,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         var client = CreateClient(request.Database);
+
+        // Binlog 行事件通过内部数字 ID 引用表。
+        // 保存最新的表映射，后续行事件才能按表名解析。
         var tableMaps = new Dictionary<long, TableContext>();
+
+        // Binlog 中会重复携带表元数据。
+        // 对同一个数据库和表只查询一次 INFORMATION_SCHEMA。
         var columnNameCache = new Dictionary<string, IReadOnlyList<string>>(StringComparer.OrdinalIgnoreCase);
 
         await foreach (var (header, binlogEvent) in client.Replicate(cancellationToken))
         {
             if (binlogEvent is TableMapEvent tableMap)
             {
+                // 必须先读取表映射，才能解析该表后续的行事件。
                 if (!MatchesTarget(request, tableMap.DatabaseName, tableMap.TableName))
                 {
                     tableMaps.Remove(tableMap.TableId);
@@ -45,6 +62,8 @@ public sealed class MySqlCdcChangeStreamFactory(MySqlCdcSettings settings)
                 continue;
             }
 
+            // 一个行事件可能包含多行数据，因此每行生成一个标准化事件，
+            // 同时保留该事件对应的 Binlog 位点。
             switch (binlogEvent)
             {
                 case WriteRowsEvent writeRows
@@ -111,10 +130,19 @@ public sealed class MySqlCdcChangeStreamFactory(MySqlCdcSettings settings)
             options.SslMode = SslMode.Disabled;
             options.Blocking = true;
             options.HeartbeatInterval = TimeSpan.FromSeconds(15);
+
+            // 短时监听只需要返回监听启动之后产生的变化，因此从 Binlog 末尾开始。
             options.Binlog = BinlogOptions.FromEnd();
         });
     }
 
+    /// <summary>
+    /// 从 Binlog 元数据或 INFORMATION_SCHEMA 中解析列名。
+    /// </summary>
+    /// <remarks>
+    /// 如果两者都无法提供完整的表结构，则返回按位置生成的备用列名，
+    /// 保证数据仍然可以被观察到，而不是直接丢弃整行。
+    /// </remarks>
     private async Task<IReadOnlyList<string>> ResolveColumnNamesAsync(
         TableMapEvent tableMap,
         CancellationToken cancellationToken)
@@ -167,12 +195,18 @@ public sealed class MySqlCdcChangeStreamFactory(MySqlCdcSettings settings)
             .ToArray();
     }
 
+    /// <summary>
+    /// 应用监听请求中的数据库过滤条件和可选的表过滤条件。
+    /// </summary>
     private static bool MatchesTarget(MySqlWatchRequest request, string database, string table)
     {
         return string.Equals(request.Database, database, StringComparison.OrdinalIgnoreCase) &&
                (request.Tables.Count == 0 || request.Tables.Contains(table));
     }
 
+    /// <summary>
+    /// 将行单元格映射为列名，同时保留空值和驱动程序返回的原始值类型。
+    /// </summary>
     private static IReadOnlyDictionary<string, object?> MapRow(
         IReadOnlyList<string> columnNames,
         IReadOnlyList<object?> cells)
@@ -188,6 +222,9 @@ public sealed class MySqlCdcChangeStreamFactory(MySqlCdcSettings settings)
         return values;
     }
 
+    /// <summary>
+    /// 创建所有行操作共用的事件封装对象。
+    /// </summary>
     private static DatabaseChange CreateChange(
         BinlogClient client,
         EventHeader header,
