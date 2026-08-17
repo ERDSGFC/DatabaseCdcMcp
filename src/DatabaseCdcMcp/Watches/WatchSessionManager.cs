@@ -13,7 +13,7 @@ namespace DatabaseCdcMcp.Watches;
 public sealed class WatchSessionManager
 {
     private const int MaxConcurrentSessions = 1;
-    private static readonly TimeSpan MaxDuration = TimeSpan.FromMinutes(30);
+    private static readonly TimeSpan MaxDuration = TimeSpan.FromHours(1);
     private const int MaxRetainedEvents = 100_000;
 
     private readonly ConcurrentDictionary<string, WatchSession> _sessions = new();

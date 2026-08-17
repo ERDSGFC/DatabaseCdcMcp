@@ -24,7 +24,7 @@ public static class MySqlWatchTools
         [Description("Exact MySQL database name to monitor. The database must already exist and be accessible to the configured user.")] string database,
         [Description("Optional exact table names to monitor. An empty or omitted array monitors every table in the database.")] string[]? tables = null,
         [Description("Optional operation filter. Allowed values are insert, update, and delete. An empty or omitted array includes all three operations.")] string[]? operations = null,
-        [Description("How long to collect events, in seconds. Must be between 1 and 1800; defaults to 300 seconds. The watch expires automatically.")] int durationSeconds = 300,
+        [Description("How long to collect events, in seconds. Must be between 1 and 3600; defaults to 600 seconds. The watch expires automatically.")] int durationSeconds = 600,
         [Description("Maximum number of events retained in memory for this watch. Must be between 1 and 100000; older events are not persisted.")] int maxEvents = 1000)
     {
         return Invoke(() => manager.Start(database, tables, operations, durationSeconds, maxEvents));

@@ -12,14 +12,38 @@ namespace DatabaseCdcMcp.Tests;
 public sealed class WatchSessionManagerTests
 {
     [Fact]
-    public void StartMysqlWatchDefaultsToFiveMinutes()
+    public void StartMysqlWatchDefaultsToTenMinutes()
     {
         var durationParameter = typeof(MySqlWatchTools)
             .GetMethod(nameof(MySqlWatchTools.StartMysqlWatch))!
             .GetParameters()
             .Single(parameter => parameter.Name == "durationSeconds");
 
-        Assert.Equal(300, durationParameter.DefaultValue);
+        Assert.Equal(600, durationParameter.DefaultValue);
+    }
+
+    [Fact]
+    public async Task OneHourDurationIsAccepted()
+    {
+        var manager = CreateManager(new BlockingChangeStreamFactory());
+
+        var started = manager.Start("demo", null, null, 3_600, 100);
+
+        Assert.Equal(started.StartedAt.AddHours(1), started.ExpiresAt);
+
+        manager.Stop(started.WatchId);
+        await WaitUntilFinishedAsync(manager, started.WatchId);
+    }
+
+    [Fact]
+    public void DurationLongerThanOneHourIsRejected()
+    {
+        var manager = CreateManager(new SequenceChangeStreamFactory([]));
+
+        var exception = Assert.Throws<WatchException>(() =>
+            manager.Start("demo", null, null, 3_601, 100));
+
+        Assert.Contains("between 1 and 3600", exception.Message);
     }
 
     [Fact]
