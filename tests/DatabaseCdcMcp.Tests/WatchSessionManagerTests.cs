@@ -62,6 +62,27 @@ public sealed class WatchSessionManagerTests
         Assert.Equal("stopped_by_user", status.FinishReason);
     }
 
+    [Fact]
+    public async Task CurrentTargetsIncludeOnlyActiveWatch()
+    {
+        var manager = CreateManager(new BlockingChangeStreamFactory());
+        var started = manager.Start("demo", ["orders", "customers"], ["insert", "update"], 30, 100);
+
+        var targets = manager.GetCurrentTargets();
+
+        var target = Assert.Single(targets.Watches);
+        Assert.Equal(started.WatchId, target.WatchId);
+        Assert.Equal("demo", target.Database);
+        Assert.False(target.AllTables);
+        Assert.Equal(["customers", "orders"], target.Tables);
+        Assert.Equal(["insert", "update"], target.Operations);
+
+        manager.Stop(started.WatchId);
+        await WaitUntilFinishedAsync(manager, started.WatchId);
+
+        Assert.Empty(manager.GetCurrentTargets().Watches);
+    }
+
     private static WatchSessionManager CreateManager(IMySqlChangeStreamFactory factory)
     {
         return new WatchSessionManager(

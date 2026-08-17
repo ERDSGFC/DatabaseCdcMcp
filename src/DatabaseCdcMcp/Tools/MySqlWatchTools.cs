@@ -62,6 +62,20 @@ public static class MySqlWatchTools
     }
 
     [McpServerTool(
+        Name = "get_mysql_watch_targets",
+        Title = "Get current MySQL watch targets",
+        ReadOnly = true,
+        Destructive = false,
+        Idempotent = true,
+        OpenWorld = false,
+        UseStructuredContent = true)]
+    [Description("Returns the database, tables and operations currently being watched.")]
+    public static WatchTargetsResponse GetMysqlWatchTargets(WatchSessionManager manager)
+    {
+        return manager.GetCurrentTargets();
+    }
+
+    [McpServerTool(
         Name = "stop_mysql_watch",
         Title = "Stop MySQL watch",
         ReadOnly = false,

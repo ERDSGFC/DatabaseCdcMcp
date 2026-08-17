@@ -261,6 +261,7 @@ D:\desktop\DatabaseCdcMcp\artifacts\win-x64\DatabaseCdcMcp.exe
 start_mysql_watch
 get_mysql_watch_events
 get_mysql_watch_status
+get_mysql_watch_targets
 stop_mysql_watch
 get_mysql_table_schema
 get_mysql_table_data
@@ -305,6 +306,7 @@ MYSQL_CDC_SERVER_ID = "6174"
 start_mysql_watch
 get_mysql_watch_events
 get_mysql_watch_status
+get_mysql_watch_targets
 stop_mysql_watch
 get_mysql_table_schema
 get_mysql_table_data
@@ -375,7 +377,36 @@ get_mysql_table_data
 
 如果 `tables` 为空或省略，则监听该数据库中的所有表；如果 `operations` 为空或省略，则监听 `insert`、`update` 和 `delete` 全部操作。
 
-### 第二步：在监听期间修改 MySQL 数据
+### 第二步：查询当前监听目标
+
+调用 `get_mysql_watch_targets` 时不需要传入参数。它只返回当前处于 `starting` 或 `running` 状态的监听：
+
+```json
+{}
+```
+
+返回结果类似：
+
+```json
+{
+  "watches": [
+    {
+      "watchId": "a1b2c3d4...",
+      "state": "running",
+      "database": "demo",
+      "allTables": false,
+      "tables": ["orders"],
+      "operations": ["insert", "update"],
+      "startedAt": "2026-08-17T10:00:00+00:00",
+      "expiresAt": "2026-08-17T10:02:00+00:00"
+    }
+  ]
+}
+```
+
+`allTables` 为 `true` 时表示监听该数据库的所有表，此时 `tables` 会是空数组。`watches` 为空数组表示当前没有活动监听。
+
+### 第三步：在监听期间修改 MySQL 数据
 
 必须在监听启动之后执行 SQL。例如：
 
@@ -396,7 +427,7 @@ WHERE id = 1001;
 COMMIT;
 ```
 
-### 第三步：读取事件
+### 第四步：读取事件
 
 调用 `get_mysql_watch_events`：
 
@@ -437,7 +468,7 @@ COMMIT;
 }
 ```
 
-### 第四步：继续分页读取
+### 第五步：继续分页读取
 
 将上一次响应中的 `nextSequence` 作为下一次请求的 `afterSequence`：
 
@@ -451,7 +482,7 @@ COMMIT;
 
 当 `hasMore` 为 `true` 时继续读取；为 `false` 时表示当前已经没有更多已保存事件。监听仍可能处于 `running` 状态，需要稍后再次查询。
 
-### 第五步：查询监听状态
+### 第六步：查询监听状态
 
 调用 `get_mysql_watch_status`：
 
@@ -471,7 +502,7 @@ COMMIT;
 | `stopped` | 用户主动停止或服务关闭 |
 | `faulted` | 连接、权限或其他运行错误 |
 
-### 第六步：主动停止监听
+### 第七步：主动停止监听
 
 不需要继续监听时，调用 `stop_mysql_watch`：
 
@@ -502,6 +533,10 @@ COMMIT;
 | `watchId` | 是 | `start_mysql_watch` 返回的 ID |
 | `afterSequence` | 否 | 读取该序号之后的事件，默认 0 |
 | `limit` | 否 | 本次最多返回 1000 条，默认 100 条 |
+
+### `get_mysql_watch_targets`
+
+不需要参数。返回当前活动监听的数据库、表过滤条件、操作过滤条件和有效期。`watches` 为空表示没有处于 `starting` 或 `running` 状态的监听。
 
 ### `get_mysql_watch_status` 和 `stop_mysql_watch`
 

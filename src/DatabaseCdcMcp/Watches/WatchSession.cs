@@ -98,6 +98,30 @@ internal sealed class WatchSession
         }
     }
 
+    public WatchTargetResponse? GetTarget()
+    {
+        lock (_gate)
+        {
+            if (!IsActive(_state))
+            {
+                return null;
+            }
+
+            return new WatchTargetResponse(
+                Id,
+                FormatState(_state),
+                Request.Database,
+                Request.Tables.Count == 0,
+                Request.Tables.OrderBy(table => table, StringComparer.OrdinalIgnoreCase).ToArray(),
+                Request.Operations
+                    .OrderBy(operation => operation)
+                    .Select(operation => operation.ToString().ToLowerInvariant())
+                    .ToArray(),
+                StartedAt,
+                ExpiresAt);
+        }
+    }
+
     public WatchEventsResponse GetEvents(long afterSequence, int limit)
     {
         lock (_gate)

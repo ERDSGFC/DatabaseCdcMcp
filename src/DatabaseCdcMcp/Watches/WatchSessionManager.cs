@@ -118,6 +118,21 @@ public sealed class WatchSessionManager
     public WatchStatusResponse GetStatus(string watchId) => GetSession(watchId).GetStatus();
 
     /// <summary>
+    /// 返回当前仍在运行的监听目标；已完成的监听不会出现在结果中。
+    /// </summary>
+    public WatchTargetsResponse GetCurrentTargets()
+    {
+        var watches = _sessions.Values
+            .Select(session => session.GetTarget())
+            .Where(target => target is not null)
+            .Select(target => target!)
+            .OrderBy(target => target.WatchId, StringComparer.Ordinal)
+            .ToArray();
+
+        return new WatchTargetsResponse(watches);
+    }
+
+    /// <summary>
     /// 请求取消活动监听，并返回当前状态。
     /// </summary>
     public WatchStatusResponse Stop(string watchId)
