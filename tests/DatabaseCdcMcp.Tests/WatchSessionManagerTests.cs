@@ -48,32 +48,104 @@ public sealed class WatchSessionManagerTests
     }
 
     [Fact]
-    public async Task CapturedEventsAreSequencedAndCanBeReadIncrementally()
+    public async Task CapturedTransactionsAreKeptWholeAndCanBeReadIncrementally()
     {
-        var changes = new[]
+        var transactions = new[]
         {
-            CreateChange(ChangeOperation.Insert),
-            CreateChange(ChangeOperation.Update)
+            CreateTransaction("tx-1", CreateChange(ChangeOperation.Insert)),
+            CreateTransaction(
+                "tx-2",
+                CreateChange(ChangeOperation.Update),
+                CreateChange(ChangeOperation.Insert))
         };
-        await using var context = await CreateContextAsync(new SequenceChangeStreamFactory(changes));
+        await using var context = await CreateContextAsync(new SequenceChangeStreamFactory(transactions));
         var manager = context.Manager;
 
         var started = manager.Start("demo", ["orders"], null, 30, 2);
         var status = await WaitUntilFinishedAsync(manager, started.WatchId);
 
         Assert.Equal("completed", status.State);
-        Assert.Equal("max_events_reached", status.FinishReason);
+        Assert.Equal("max_transactions_reached", status.FinishReason);
+        Assert.Equal(2, status.TransactionCount);
+        Assert.Equal(3, status.ChangeCount);
 
         var firstPage = manager.GetEvents(started.WatchId, 0, 1);
-        Assert.Single(firstPage.Events);
-        Assert.Equal(1, firstPage.Events[0].Sequence);
+        var firstTransaction = Assert.Single(firstPage.Transactions);
+        Assert.Equal(1, firstTransaction.Sequence);
+        var firstChange = Assert.Single(firstTransaction.Changes);
+        Assert.Equal(1, firstChange.Sequence);
         Assert.True(firstPage.HasMore);
 
         var secondPage = manager.GetEvents(started.WatchId, firstPage.NextSequence, 10);
-        Assert.Single(secondPage.Events);
-        Assert.Equal(2, secondPage.Events[0].Sequence);
-        Assert.EndsWith(":2", secondPage.Events[0].EventId);
+        var secondTransaction = Assert.Single(secondPage.Transactions);
+        Assert.Equal(2, secondTransaction.Sequence);
+        Assert.Equal(2, secondTransaction.Changes.Count);
+        Assert.Equal([2L, 3L], secondTransaction.Changes.Select(change => change.Sequence));
+        Assert.EndsWith(":3", secondTransaction.Changes[1].EventId);
         Assert.False(secondPage.HasMore);
+    }
+
+    [Fact]
+    public async Task TransactionLimitCountsCompleteTransactionsRatherThanRowChanges()
+    {
+        var transaction = CreateTransaction(
+            "tx-1",
+            CreateChange(ChangeOperation.Insert),
+            CreateChange(ChangeOperation.Update));
+        await using var context = await CreateContextAsync(
+            new SequenceChangeStreamFactory([transaction]));
+
+        var started = context.Manager.Start("demo", ["orders"], null, 30, 1);
+        var status = await WaitUntilFinishedAsync(context.Manager, started.WatchId);
+
+        Assert.Equal("max_transactions_reached", status.FinishReason);
+        Assert.Equal(1, status.TransactionCount);
+        Assert.Equal(2, status.ChangeCount);
+        var captured = Assert.Single(
+            context.Manager.GetEvents(started.WatchId, 0, 10).Transactions);
+        Assert.Equal(2, captured.Changes.Count);
+    }
+
+    [Fact]
+    public void OversizedTransactionIsRejectedWithoutRetainingPartialChanges()
+    {
+        var session = CreateSession(maxRetainedChanges: 10, maxChangesPerTransaction: 1);
+        var transaction = CreateTransaction(
+            "tx-1",
+            CreateChange(ChangeOperation.Insert),
+            CreateChange(ChangeOperation.Update));
+
+        var result = session.TryAddTransaction(transaction);
+
+        Assert.Equal(AddTransactionResult.TransactionChangeLimitReached, result);
+        Assert.Empty(session.GetEvents(0, 10).Transactions);
+        Assert.Equal(0, session.GetStatus().TransactionCount);
+        Assert.Equal(0, session.GetStatus().ChangeCount);
+    }
+
+    [Fact]
+    public void WatchRetentionLimitRejectsTheNextWholeTransaction()
+    {
+        var session = CreateSession(maxRetainedChanges: 3, maxChangesPerTransaction: 3);
+        var first = CreateTransaction(
+            "tx-1",
+            CreateChange(ChangeOperation.Insert),
+            CreateChange(ChangeOperation.Update));
+        var second = CreateTransaction(
+            "tx-2",
+            CreateChange(ChangeOperation.Insert),
+            CreateChange(ChangeOperation.Delete));
+
+        Assert.Equal(AddTransactionResult.Added, session.TryAddTransaction(first));
+        Assert.Equal(
+            AddTransactionResult.WatchChangeLimitReached,
+            session.TryAddTransaction(second));
+
+        var retained = Assert.Single(session.GetEvents(0, 10).Transactions);
+        Assert.Equal("tx-1", retained.TransactionId);
+        Assert.Equal(2, retained.Changes.Count);
+        Assert.Equal(1, session.GetStatus().TransactionCount);
+        Assert.Equal(2, session.GetStatus().ChangeCount);
     }
 
     [Fact]
@@ -131,22 +203,28 @@ public sealed class WatchSessionManagerTests
         var ordersWatch = manager.Start("demo", ["orders"], ["insert"], 30, 1);
         var customersWatch = manager.Start("demo", ["customers"], ["update"], 30, 1);
 
-        factory.Publish(CreateChange(ChangeOperation.Delete, "orders"));
-        factory.Publish(CreateChange(ChangeOperation.Insert, "orders"));
-        factory.Publish(CreateChange(ChangeOperation.Update, "customers"));
+        factory.Publish(CreateTransaction("tx-delete", CreateChange(ChangeOperation.Delete, "orders")));
+        factory.Publish(CreateTransaction(
+            "tx-shared",
+            CreateChange(ChangeOperation.Insert, "orders"),
+            CreateChange(ChangeOperation.Update, "customers")));
 
         var ordersStatus = await WaitUntilFinishedAsync(manager, ordersWatch.WatchId);
         var customersStatus = await WaitUntilFinishedAsync(manager, customersWatch.WatchId);
 
         Assert.Equal(1, factory.StreamCount);
-        Assert.Equal("max_events_reached", ordersStatus.FinishReason);
-        Assert.Equal("max_events_reached", customersStatus.FinishReason);
+        Assert.Equal("max_transactions_reached", ordersStatus.FinishReason);
+        Assert.Equal("max_transactions_reached", customersStatus.FinishReason);
 
-        var ordersEvent = Assert.Single(manager.GetEvents(ordersWatch.WatchId, 0, 10).Events);
+        var ordersTransaction = Assert.Single(manager.GetEvents(ordersWatch.WatchId, 0, 10).Transactions);
+        Assert.Equal("tx-shared", ordersTransaction.TransactionId);
+        var ordersEvent = Assert.Single(ordersTransaction.Changes);
         Assert.Equal("orders", ordersEvent.Table);
         Assert.Equal(ChangeOperation.Insert, ordersEvent.Operation);
 
-        var customersEvent = Assert.Single(manager.GetEvents(customersWatch.WatchId, 0, 10).Events);
+        var customersTransaction = Assert.Single(manager.GetEvents(customersWatch.WatchId, 0, 10).Transactions);
+        Assert.Equal("tx-shared", customersTransaction.TransactionId);
+        var customersEvent = Assert.Single(customersTransaction.Changes);
         Assert.Equal("customers", customersEvent.Table);
         Assert.Equal(ChangeOperation.Update, customersEvent.Operation);
     }
@@ -162,16 +240,16 @@ public sealed class WatchSessionManagerTests
         var activeWatch = manager.Start("demo", ["customers"], null, 30, 1);
 
         manager.Stop(stoppedWatch.WatchId);
-        factory.Publish(CreateChange(ChangeOperation.Insert, "customers"));
+        factory.Publish(CreateTransaction("tx-1", CreateChange(ChangeOperation.Insert, "customers")));
 
         var stoppedStatus = await WaitUntilFinishedAsync(manager, stoppedWatch.WatchId);
         var activeStatus = await WaitUntilFinishedAsync(manager, activeWatch.WatchId);
 
         Assert.Equal(1, factory.StreamCount);
         Assert.Equal("stopped_by_user", stoppedStatus.FinishReason);
-        Assert.Empty(manager.GetEvents(stoppedWatch.WatchId, 0, 10).Events);
-        Assert.Equal("max_events_reached", activeStatus.FinishReason);
-        Assert.Single(manager.GetEvents(activeWatch.WatchId, 0, 10).Events);
+        Assert.Empty(manager.GetEvents(stoppedWatch.WatchId, 0, 10).Transactions);
+        Assert.Equal("max_transactions_reached", activeStatus.FinishReason);
+        Assert.Single(manager.GetEvents(activeWatch.WatchId, 0, 10).Transactions);
     }
 
     [Fact]
@@ -231,6 +309,40 @@ public sealed class WatchSessionManagerTests
             null);
     }
 
+    private static WatchSession CreateSession(
+        int maxTransactions = 10,
+        int maxRetainedChanges = 100,
+        int maxChangesPerTransaction = 100)
+    {
+        var request = new MySqlWatchRequest(
+            "demo",
+            new HashSet<string>(["orders"], StringComparer.OrdinalIgnoreCase),
+            new HashSet<ChangeOperation>(Enum.GetValues<ChangeOperation>()),
+            TimeSpan.FromMinutes(1),
+            maxTransactions);
+
+        return new WatchSession(
+            "watch-1",
+            request,
+            DateTimeOffset.UtcNow,
+            maxRetainedChanges,
+            maxChangesPerTransaction);
+    }
+
+    private static DatabaseTransaction CreateTransaction(
+        string transactionId,
+        params DatabaseChange[] changes)
+    {
+        return new DatabaseTransaction(
+            0,
+            transactionId,
+            transactionId.StartsWith("gtid-", StringComparison.Ordinal) ? transactionId : null,
+            DateTimeOffset.UtcNow,
+            "mysql-bin.000001",
+            200,
+            changes);
+    }
+
     private static async Task<WatchStatusResponse> WaitUntilFinishedAsync(
         WatchSessionManager manager,
         string watchId)
@@ -251,19 +363,19 @@ public sealed class WatchSessionManagerTests
         throw new TimeoutException("The watch did not finish in time.");
     }
 
-    private sealed class SequenceChangeStreamFactory(IEnumerable<DatabaseChange> changes)
+    private sealed class SequenceChangeStreamFactory(IEnumerable<DatabaseTransaction> transactions)
         : IMySqlChangeStreamFactory
     {
-        public async IAsyncEnumerable<DatabaseChange> ReadChangesAsync(
+        public async IAsyncEnumerable<DatabaseTransaction> ReadChangesAsync(
             Func<string, string, bool> shouldCaptureTable,
             [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
         {
-            foreach (var change in changes)
+            foreach (var transaction in transactions)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                if (shouldCaptureTable(change.Database, change.Table))
+                if (transaction.Changes.Any(change => shouldCaptureTable(change.Database, change.Table)))
                 {
-                    yield return change;
+                    yield return transaction;
                 }
 
                 await Task.Yield();
@@ -273,7 +385,7 @@ public sealed class WatchSessionManagerTests
 
     private sealed class BlockingChangeStreamFactory : IMySqlChangeStreamFactory
     {
-        public async IAsyncEnumerable<DatabaseChange> ReadChangesAsync(
+        public async IAsyncEnumerable<DatabaseTransaction> ReadChangesAsync(
             Func<string, string, bool> shouldCaptureTable,
             [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
         {
@@ -284,25 +396,25 @@ public sealed class WatchSessionManagerTests
 
     private sealed class ChannelChangeStreamFactory : IMySqlChangeStreamFactory
     {
-        private readonly Channel<DatabaseChange> _changes = Channel.CreateUnbounded<DatabaseChange>();
+        private readonly Channel<DatabaseTransaction> _transactions = Channel.CreateUnbounded<DatabaseTransaction>();
         private int _streamCount;
 
         public int StreamCount => Volatile.Read(ref _streamCount);
 
-        public void Publish(DatabaseChange change) =>
-            Assert.True(_changes.Writer.TryWrite(change));
+        public void Publish(DatabaseTransaction transaction) =>
+            Assert.True(_transactions.Writer.TryWrite(transaction));
 
-        public async IAsyncEnumerable<DatabaseChange> ReadChangesAsync(
+        public async IAsyncEnumerable<DatabaseTransaction> ReadChangesAsync(
             Func<string, string, bool> shouldCaptureTable,
             [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
         {
             Interlocked.Increment(ref _streamCount);
 
-            await foreach (var change in _changes.Reader.ReadAllAsync(cancellationToken))
+            await foreach (var transaction in _transactions.Reader.ReadAllAsync(cancellationToken))
             {
-                if (shouldCaptureTable(change.Database, change.Table))
+                if (transaction.Changes.Any(change => shouldCaptureTable(change.Database, change.Table)))
                 {
-                    yield return change;
+                    yield return transaction;
                 }
             }
         }
@@ -314,7 +426,7 @@ public sealed class WatchSessionManagerTests
 
         public int StreamCount => Volatile.Read(ref _streamCount);
 
-        public async IAsyncEnumerable<DatabaseChange> ReadChangesAsync(
+        public async IAsyncEnumerable<DatabaseTransaction> ReadChangesAsync(
             Func<string, string, bool> shouldCaptureTable,
             [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
         {

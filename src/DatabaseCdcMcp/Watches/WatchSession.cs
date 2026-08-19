@@ -2,32 +2,31 @@ using DatabaseCdcMcp.Domain;
 
 namespace DatabaseCdcMcp.Watches;
 
-internal sealed class WatchSession
+internal sealed class WatchSession(
+    string id,
+    MySqlWatchRequest request,
+    DateTimeOffset startedAt,
+    int maxRetainedChanges,
+    int maxChangesPerTransaction)
 {
-    private readonly object _gate = new();
-    private readonly List<DatabaseChange> _events = [];
+    private readonly Lock _gate = new();
+    private readonly List<DatabaseTransaction> _transactions = [];
     private readonly TaskCompletionSource _completionSource = new(
         TaskCreationOptions.RunContinuationsAsynchronously);
+
+    private int _changeCount;
     private WatchState _state = WatchState.Starting;
     private DateTimeOffset? _finishedAt;
     private string? _finishReason;
     private string? _error;
 
-    public WatchSession(string id, MySqlWatchRequest request, DateTimeOffset startedAt)
-    {
-        Id = id;
-        Request = request;
-        StartedAt = startedAt;
-        ExpiresAt = startedAt.Add(request.Duration);
-    }
+    public string Id { get; } = id;
 
-    public string Id { get; }
+    public MySqlWatchRequest Request { get; } = request;
 
-    public MySqlWatchRequest Request { get; }
+    public DateTimeOffset StartedAt { get; } = startedAt;
 
-    public DateTimeOffset StartedAt { get; }
-
-    public DateTimeOffset ExpiresAt { get; }
+    public DateTimeOffset ExpiresAt { get; } = startedAt.Add(request.Duration);
 
     public Task Completion => _completionSource.Task;
 
@@ -52,30 +51,59 @@ internal sealed class WatchSession
         }
     }
 
-    public bool TryAddEvent(DatabaseChange change, out bool reachedLimit)
+    public AddTransactionResult TryAddTransaction(DatabaseTransaction transaction)
     {
         lock (_gate)
         {
-            reachedLimit = false;
-
-            if (!IsActiveState(_state) ||
-                !string.Equals(Request.Database, change.Database, StringComparison.OrdinalIgnoreCase) ||
-                (Request.Tables.Count > 0 && !Request.Tables.Contains(change.Table)) ||
-                !Request.Operations.Contains(change.Operation) ||
-                _events.Count >= Request.MaxEvents)
+            if (!IsActiveState(_state))
             {
-                return false;
+                return AddTransactionResult.NotMatched;
             }
 
-            var sequence = _events.Count + 1L;
-            _events.Add(change with
-            {
-                Sequence = sequence,
-                EventId = $"{Id}:{sequence}"
-            });
+            var matchingChanges = transaction.Changes
+                .Where(change =>
+                    string.Equals(Request.Database, change.Database, StringComparison.OrdinalIgnoreCase) &&
+                    (Request.Tables.Count == 0 || Request.Tables.Contains(change.Table)) &&
+                    Request.Operations.Contains(change.Operation))
+                .ToArray();
 
-            reachedLimit = _events.Count >= Request.MaxEvents;
-            return true;
+            if (matchingChanges.Length == 0)
+            {
+                return AddTransactionResult.NotMatched;
+            }
+
+            if (matchingChanges.Length > maxChangesPerTransaction)
+            {
+                return AddTransactionResult.TransactionChangeLimitReached;
+            }
+
+            if (_changeCount > maxRetainedChanges - matchingChanges.Length)
+            {
+                return AddTransactionResult.WatchChangeLimitReached;
+            }
+
+            var sequencedChanges = matchingChanges
+                .Select((change, index) =>
+                {
+                    var changeSequence = _changeCount + index + 1L;
+                    return change with
+                    {
+                        Sequence = changeSequence,
+                        EventId = $"{Id}:{changeSequence}"
+                    };
+                })
+                .ToArray();
+            var transactionSequence = _transactions.Count + 1L;
+            _transactions.Add(transaction with
+            {
+                Sequence = transactionSequence,
+                Changes = sequencedChanges
+            });
+            _changeCount += sequencedChanges.Length;
+
+            return _transactions.Count >= Request.MaxTransactions
+                ? AddTransactionResult.MaxTransactionsReached
+                : AddTransactionResult.Added;
         }
     }
 
@@ -106,7 +134,8 @@ internal sealed class WatchSession
             return new WatchStatusResponse(
                 Id,
                 FormatState(_state),
-                _events.Count,
+                _transactions.Count,
+                _changeCount,
                 StartedAt,
                 ExpiresAt,
                 _finishedAt,
@@ -143,18 +172,18 @@ internal sealed class WatchSession
     {
         lock (_gate)
         {
-            var events = _events
-                .Where(change => change.Sequence > afterSequence)
+            var transactions = _transactions
+                .Where(transaction => transaction.Sequence > afterSequence)
                 .Take(limit)
                 .ToArray();
 
-            var nextSequence = events.Length == 0 ? afterSequence : events[^1].Sequence;
-            var hasMore = _events.Count > nextSequence;
+            var nextSequence = transactions.Length == 0 ? afterSequence : transactions[^1].Sequence;
+            var hasMore = _transactions.Count > nextSequence;
 
             return new WatchEventsResponse(
                 Id,
                 FormatState(_state),
-                events,
+                transactions,
                 nextSequence,
                 hasMore);
         }
@@ -183,4 +212,13 @@ internal sealed class WatchSession
         state is WatchState.Starting or WatchState.Running;
 
     private static string FormatState(WatchState state) => state.ToString().ToLowerInvariant();
+}
+
+internal enum AddTransactionResult
+{
+    NotMatched,
+    Added,
+    MaxTransactionsReached,
+    TransactionChangeLimitReached,
+    WatchChangeLimitReached
 }
