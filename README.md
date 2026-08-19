@@ -101,10 +101,35 @@ SHOW MASTER STATUS;
 - `log_bin` 为 `ON`
 - `binlog_format` 为 `ROW`
 - `binlog_row_image` 为 `FULL`
+- `binlog_rows_query_log_events` 为 `ON`（需要返回原始 SQL 时）
 - `server_id` 为非零值，并且与 MCP 使用的 `MYSQL_CDC_SERVER_ID` 不同
 - `expire_logs_days` 为你期望的保留天数
 
 如果配置不正确，请在 MySQL 配置文件的 `[mysqld]` 节中加入上面的配置并重启 MySQL。具体配置文件位置取决于你的安装方式。
+
+### 临时启用原始 SQL 记录
+
+如果暂时不想修改 MySQL 配置文件，可以使用具有动态系统变量修改权限的账号执行：
+
+```sql
+SET GLOBAL binlog_rows_query_log_events = ON;
+```
+
+该设置会立即对之后写入 Binlog 的行变化生效。它不会补写已经存在的 Binlog 事件，也不会自动关联已经发生的事务；请先执行这条命令，再启动 MCP 监听并执行新的提交事务。
+
+可以检查当前值：
+
+```sql
+SHOW GLOBAL VARIABLES LIKE 'binlog_rows_query_log_events';
+```
+
+如果结果为 `ON`，后续 MCP 返回的 `transactions[].queries` 和 `changes[].query` 才会有原始 SQL。该设置通常在 MySQL 重启后恢复，因此需要长期启用时，仍应把下面配置写入 `[mysqld]`：
+
+```ini
+binlog_rows_query_log_events=ON
+```
+
+执行 `SET GLOBAL` 需要相应的系统变量修改权限；权限不足时请使用管理员账号操作。原始 SQL 可能包含敏感参数，生产环境启用前应评估 Binlog 和 MCP 返回数据的访问范围。
 
 也可以临时修改 Binlog 过期天数：
 
