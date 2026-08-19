@@ -5,6 +5,7 @@ using DatabaseCdcMcp.Tools;
 using DatabaseCdcMcp.Watches;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging.Abstractions;
+using System.Threading.Channels;
 using Xunit;
 
 namespace DatabaseCdcMcp.Tests;
@@ -119,6 +120,57 @@ public sealed class WatchSessionManagerTests
         Assert.Empty(manager.GetCurrentTargets().Watches);
     }
 
+    [Fact]
+    public async Task MultipleWatchesShareOneStreamAndReceiveOnlyMatchingEvents()
+    {
+        var factory = new ChannelChangeStreamFactory();
+        var manager = CreateManager(factory);
+
+        var ordersWatch = manager.Start("demo", ["orders"], ["insert"], 30, 1);
+        var customersWatch = manager.Start("demo", ["customers"], ["update"], 30, 1);
+
+        factory.Publish(CreateChange(ChangeOperation.Delete, "orders"));
+        factory.Publish(CreateChange(ChangeOperation.Insert, "orders"));
+        factory.Publish(CreateChange(ChangeOperation.Update, "customers"));
+
+        var ordersStatus = await WaitUntilFinishedAsync(manager, ordersWatch.WatchId);
+        var customersStatus = await WaitUntilFinishedAsync(manager, customersWatch.WatchId);
+
+        Assert.Equal(1, factory.StreamCount);
+        Assert.Equal("max_events_reached", ordersStatus.FinishReason);
+        Assert.Equal("max_events_reached", customersStatus.FinishReason);
+
+        var ordersEvent = Assert.Single(manager.GetEvents(ordersWatch.WatchId, 0, 10).Events);
+        Assert.Equal("orders", ordersEvent.Table);
+        Assert.Equal(ChangeOperation.Insert, ordersEvent.Operation);
+
+        var customersEvent = Assert.Single(manager.GetEvents(customersWatch.WatchId, 0, 10).Events);
+        Assert.Equal("customers", customersEvent.Table);
+        Assert.Equal(ChangeOperation.Update, customersEvent.Operation);
+    }
+
+    [Fact]
+    public async Task StoppingOneWatchDoesNotStopTheSharedStreamOrOtherWatches()
+    {
+        var factory = new ChannelChangeStreamFactory();
+        var manager = CreateManager(factory);
+
+        var stoppedWatch = manager.Start("demo", ["orders"], null, 30, 10);
+        var activeWatch = manager.Start("demo", ["customers"], null, 30, 1);
+
+        manager.Stop(stoppedWatch.WatchId);
+        factory.Publish(CreateChange(ChangeOperation.Insert, "customers"));
+
+        var stoppedStatus = await WaitUntilFinishedAsync(manager, stoppedWatch.WatchId);
+        var activeStatus = await WaitUntilFinishedAsync(manager, activeWatch.WatchId);
+
+        Assert.Equal(1, factory.StreamCount);
+        Assert.Equal("stopped_by_user", stoppedStatus.FinishReason);
+        Assert.Empty(manager.GetEvents(stoppedWatch.WatchId, 0, 10).Events);
+        Assert.Equal("max_events_reached", activeStatus.FinishReason);
+        Assert.Single(manager.GetEvents(activeWatch.WatchId, 0, 10).Events);
+    }
+
     private static WatchSessionManager CreateManager(IMySqlChangeStreamFactory factory)
     {
         return new WatchSessionManager(
@@ -128,13 +180,13 @@ public sealed class WatchSessionManagerTests
             NullLogger<WatchSessionManager>.Instance);
     }
 
-    private static DatabaseChange CreateChange(ChangeOperation operation)
+    private static DatabaseChange CreateChange(ChangeOperation operation, string table = "orders")
     {
         return new DatabaseChange(
             0,
             string.Empty,
             "demo",
-            "orders",
+            table,
             operation,
             null,
             new Dictionary<string, object?> { ["id"] = 1 },
@@ -168,13 +220,17 @@ public sealed class WatchSessionManagerTests
         : IMySqlChangeStreamFactory
     {
         public async IAsyncEnumerable<DatabaseChange> ReadChangesAsync(
-            MySqlWatchRequest request,
+            Func<string, string, bool> shouldCaptureTable,
             [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
         {
             foreach (var change in changes)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                yield return change;
+                if (shouldCaptureTable(change.Database, change.Table))
+                {
+                    yield return change;
+                }
+
                 await Task.Yield();
             }
         }
@@ -183,11 +239,37 @@ public sealed class WatchSessionManagerTests
     private sealed class BlockingChangeStreamFactory : IMySqlChangeStreamFactory
     {
         public async IAsyncEnumerable<DatabaseChange> ReadChangesAsync(
-            MySqlWatchRequest request,
+            Func<string, string, bool> shouldCaptureTable,
             [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
         {
             await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
             yield break;
+        }
+    }
+
+    private sealed class ChannelChangeStreamFactory : IMySqlChangeStreamFactory
+    {
+        private readonly Channel<DatabaseChange> _changes = Channel.CreateUnbounded<DatabaseChange>();
+        private int _streamCount;
+
+        public int StreamCount => Volatile.Read(ref _streamCount);
+
+        public void Publish(DatabaseChange change) =>
+            Assert.True(_changes.Writer.TryWrite(change));
+
+        public async IAsyncEnumerable<DatabaseChange> ReadChangesAsync(
+            Func<string, string, bool> shouldCaptureTable,
+            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            Interlocked.Increment(ref _streamCount);
+
+            await foreach (var change in _changes.Reader.ReadAllAsync(cancellationToken))
+            {
+                if (shouldCaptureTable(change.Database, change.Table))
+                {
+                    yield return change;
+                }
+            }
         }
     }
 

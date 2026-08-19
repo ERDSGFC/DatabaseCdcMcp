@@ -12,13 +12,15 @@ namespace DatabaseCdcMcp.Watches;
 /// </summary>
 public sealed class WatchSessionManager
 {
-    private const int MaxConcurrentSessions = 1;
+    private const int MaxConcurrentSessions = 32;
     private static readonly TimeSpan MaxDuration = TimeSpan.FromHours(1);
     private const int MaxRetainedEvents = 100_000;
 
     private readonly ConcurrentDictionary<string, WatchSession> _sessions = new();
     private readonly SemaphoreSlim _sessionSlots = new(MaxConcurrentSessions, MaxConcurrentSessions);
-    
+    private readonly Lock _changeStreamGate = new();
+    private Task? _changeStreamTask;
+
     private readonly IMySqlChangeStreamFactory _changeStreamFactory;
     private readonly MySqlCdcSettings _settings;
     private readonly IHostApplicationLifetime _applicationLifetime;
@@ -82,7 +84,8 @@ public sealed class WatchSessionManager
             throw new WatchException("Failed to allocate a watch session.");
         }
 
-        _ = RunSessionAsync(session);
+        _ = RunSessionLifetimeAsync(session);
+        EnsureChangeStreamStarted();
 
         return new StartWatchResponse(
             id,
@@ -142,57 +145,116 @@ public sealed class WatchSessionManager
         return session.GetStatus();
     }
 
-    private async Task RunSessionAsync(WatchSession session)
+    private async Task RunSessionLifetimeAsync(WatchSession session)
     {
-        // 监听可能因为达到时长、主动停止或 Host 关闭而结束。
-        // 使用链接取消令牌，让 CDC 连接器统一感知这三种情况。
-        using var timeoutSource = new CancellationTokenSource(session.Request.Duration);
-        using var linkedSource = CancellationTokenSource.CreateLinkedTokenSource(
-            session.StopToken,
-            timeoutSource.Token,
-            _applicationLifetime.ApplicationStopping);
-
         try
         {
             session.MarkRunning();
-
-            await foreach (var change in _changeStreamFactory.ReadChangesAsync(
-                               session.Request,
-                               linkedSource.Token))
-            {
-                if (!session.AddEvent(change))
-                {
-                    session.Complete("max_events_reached");
-                    break;
-                }
-            }
-
-            if (!linkedSource.IsCancellationRequested)
-            {
-                session.Complete("stream_ended");
-            }
+            await session.Completion.WaitAsync(
+                session.Request.Duration,
+                _applicationLifetime.ApplicationStopping);
         }
-        // 将不同的取消原因转换为调用方可见的监听状态。
-        catch (OperationCanceledException) when (timeoutSource.IsCancellationRequested)
+        catch (TimeoutException)
         {
             session.Complete("duration_elapsed");
-        }
-        catch (OperationCanceledException) when (session.StopToken.IsCancellationRequested)
-        {
-            session.MarkStopped("stopped_by_user");
         }
         catch (OperationCanceledException) when (_applicationLifetime.ApplicationStopping.IsCancellationRequested)
         {
             session.MarkStopped("server_shutdown");
         }
-        catch (Exception exception)
-        {
-            _logger.LogError(exception, "MySQL watch {WatchId} failed", session.Id);
-            session.Fail(exception);
-        }
         finally
         {
             _sessionSlots.Release();
+        }
+    }
+
+    private void EnsureChangeStreamStarted()
+    {
+        lock (_changeStreamGate)
+        {
+            if (_changeStreamTask is null || _changeStreamTask.IsCompleted)
+            {
+                _changeStreamTask = RunChangeStreamAsync();
+            }
+        }
+    }
+
+    private async Task RunChangeStreamAsync()
+    {
+        try
+        {
+            await foreach (var change in _changeStreamFactory.ReadChangesAsync(
+                               ShouldCaptureTable,
+                               _applicationLifetime.ApplicationStopping))
+            {
+                DispatchChange(change);
+            }
+
+            if (!_applicationLifetime.ApplicationStopping.IsCancellationRequested)
+            {
+                CompleteActiveSessions("stream_ended");
+            }
+        }
+        catch (OperationCanceledException) when (_applicationLifetime.ApplicationStopping.IsCancellationRequested)
+        {
+            StopActiveSessions("server_shutdown");
+        }
+        catch (Exception exception)
+        {
+            _logger.LogError(exception, "The shared MySQL change stream failed.");
+            FailActiveSessions(exception);
+        }
+        finally
+        {
+            lock (_changeStreamGate)
+            {
+                _changeStreamTask = null;
+
+                // A watch may have been added while the previous stream was exiting.
+                if (!_applicationLifetime.ApplicationStopping.IsCancellationRequested &&
+                    _sessions.Values.Any(session => session.GetTarget() is not null))
+                {
+                    _changeStreamTask = RunChangeStreamAsync();
+                }
+            }
+        }
+    }
+
+    private bool ShouldCaptureTable(string database, string table) =>
+        _sessions.Values.Any(session => session.MatchesTarget(database, table));
+
+    private void DispatchChange(DatabaseChange change)
+    {
+        foreach (var session in _sessions.Values)
+        {
+            if (session.TryAddEvent(change, out var reachedLimit) && reachedLimit)
+            {
+                session.Complete("max_events_reached");
+            }
+        }
+    }
+
+    private void CompleteActiveSessions(string reason)
+    {
+        foreach (var session in _sessions.Values)
+        {
+            session.Complete(reason);
+        }
+    }
+
+    private void StopActiveSessions(string reason)
+    {
+        foreach (var session in _sessions.Values)
+        {
+            session.MarkStopped(reason);
+        }
+    }
+
+    private void FailActiveSessions(Exception exception)
+    {
+        foreach (var session in _sessions.Values)
+        {
+            session.Fail(exception);
         }
     }
 
