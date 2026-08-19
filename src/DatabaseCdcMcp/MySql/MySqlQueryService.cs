@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using DatabaseCdcMcp.Configuration;
 using MySqlConnector;
 
@@ -306,46 +307,83 @@ public sealed class MySqlQueryService(MySqlCdcSettings settings)
     private static string QuoteIdentifier(string identifier) => $"`{identifier.Replace("`", "``", StringComparison.Ordinal)}`";
 }
 
+[Description("Metadata for one column in a MySQL table, in table ordinal order.")]
 public sealed record MySqlColumnSchema(
+    [property: Description("One-based position of the column in the table.")]
     int OrdinalPosition,
+    [property: Description("Exact column name.")]
     string Name,
+    [property: Description("Base MySQL data type, such as varchar, bigint, or datetime.")]
     string DataType,
+    [property: Description("Complete MySQL column type declaration, including length, precision, unsigned, or enum values when applicable.")]
     string ColumnType,
+    [property: Description("MySQL nullability marker: YES or NO.")]
     string IsNullable,
+    [property: Description("MySQL index marker, such as PRI, UNI, MUL, or an empty string.")]
     string Key,
+    [property: Description("Column default value reported by MySQL, or null when COLUMN_DEFAULT is null.")]
     object? DefaultValue,
+    [property: Description("Additional MySQL column attributes, such as auto_increment or generated-column metadata.")]
     string Extra,
+    [property: Description("Column comment stored in MySQL; an empty string means no comment.")]
     string Comment);
 
+[Description("Column definitions for one existing MySQL table.")]
 public sealed record MySqlTableSchemaResponse(
+    [property: Description("Exact database name containing the table.")]
     string Database,
+    [property: Description("Exact table name described by this response.")]
     string Table,
+    [property: Description("Column definitions ordered by ordinalPosition.")]
     IReadOnlyList<MySqlColumnSchema> Columns);
 
+[Description("Summary metadata for one MySQL table or view.")]
 public sealed record MySqlTableSummary(
+    [property: Description("Exact table or view name.")]
     string Name,
+    [property: Description("MySQL table type, typically BASE TABLE or VIEW.")]
     string TableType,
+    [property: Description("Storage engine name; null when MySQL does not report an engine, such as for a view.")]
     string? Engine,
+    [property: Description("Table comment stored in MySQL; an empty string means no comment.")]
     string Comment);
 
+[Description("A paginated list of tables and views in a MySQL database.")]
 public sealed record MySqlTablesResponse(
+    [property: Description("Exact database name queried.")]
     string Database,
+    [property: Description("Literal table-name prefix applied to this query, or null when no prefix filter was used.")]
     string? TableNamePrefix,
+    [property: Description("MySQL LIKE pattern applied to this query, or null when no pattern filter was used.")]
     string? TableNameLike,
+    [property: Description("Tables and views in this page.")]
     IReadOnlyList<MySqlTableSummary> Tables,
+    [property: Description("Number of matching tables skipped before this page.")]
     long Offset,
+    [property: Description("Maximum number of tables requested for this page.")]
     int Limit,
+    [property: Description("Offset to pass to the next request; meaningful when hasMore is true.")]
     long NextOffset,
+    [property: Description("True when another page of matching tables is available.")]
     bool HasMore);
 
+[Description("A paginated snapshot of current rows from one MySQL table.")]
 public sealed record MySqlTableDataResponse(
+    [property: Description("Exact database name containing the table.")]
     string Database,
+    [property: Description("Exact table name queried.")]
     string Table,
+    [property: Description("Column names in table result order.")]
     IReadOnlyList<string> Columns,
+    [property: Description("Rows in this page; each object maps column names to their current database values.")]
     IReadOnlyList<IReadOnlyDictionary<string, object?>> Rows,
+    [property: Description("Number of rows skipped before this page.")]
     long Offset,
+    [property: Description("Maximum number of rows requested for this page.")]
     int Limit,
+    [property: Description("Offset to pass to the next request; meaningful when hasMore is true.")]
     long NextOffset,
+    [property: Description("True when another page of rows is available.")]
     bool HasMore);
 
 public sealed class MySqlQueryException(string message, Exception? innerException = null)

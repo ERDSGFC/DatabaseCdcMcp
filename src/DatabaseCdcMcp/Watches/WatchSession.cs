@@ -6,7 +6,8 @@ internal sealed class WatchSession
 {
     private readonly object _gate = new();
     private readonly List<DatabaseChange> _events = [];
-    private readonly CancellationTokenSource _stopSource = new();
+    private readonly TaskCompletionSource _completionSource = new(
+        TaskCreationOptions.RunContinuationsAsynchronously);
     private WatchState _state = WatchState.Starting;
     private DateTimeOffset? _finishedAt;
     private string? _finishReason;
@@ -28,13 +29,40 @@ internal sealed class WatchSession
 
     public DateTimeOffset ExpiresAt { get; }
 
-    public CancellationToken StopToken => _stopSource.Token;
+    public Task Completion => _completionSource.Task;
 
-    public bool AddEvent(DatabaseChange change)
+    public bool IsActive
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return IsActiveState(_state);
+            }
+        }
+    }
+
+    public bool MatchesTarget(string database, string table)
     {
         lock (_gate)
         {
-            if (!IsActive(_state) || _events.Count >= Request.MaxEvents)
+            return IsActiveState(_state) &&
+                   string.Equals(Request.Database, database, StringComparison.OrdinalIgnoreCase) &&
+                   (Request.Tables.Count == 0 || Request.Tables.Contains(table));
+        }
+    }
+
+    public bool TryAddEvent(DatabaseChange change, out bool reachedLimit)
+    {
+        lock (_gate)
+        {
+            reachedLimit = false;
+
+            if (!IsActiveState(_state) ||
+                !string.Equals(Request.Database, change.Database, StringComparison.OrdinalIgnoreCase) ||
+                (Request.Tables.Count > 0 && !Request.Tables.Contains(change.Table)) ||
+                !Request.Operations.Contains(change.Operation) ||
+                _events.Count >= Request.MaxEvents)
             {
                 return false;
             }
@@ -46,7 +74,8 @@ internal sealed class WatchSession
                 EventId = $"{Id}:{sequence}"
             });
 
-            return _events.Count < Request.MaxEvents;
+            reachedLimit = _events.Count >= Request.MaxEvents;
+            return true;
         }
     }
 
@@ -68,19 +97,7 @@ internal sealed class WatchSession
 
     public void MarkStopped(string reason) => Finish(WatchState.Stopped, reason, null);
 
-    public bool RequestStop()
-    {
-        lock (_gate)
-        {
-            if (!IsActive(_state))
-            {
-                return false;
-            }
-        }
-
-        _stopSource.Cancel();
-        return true;
-    }
+    public bool RequestStop() => Finish(WatchState.Stopped, "stopped_by_user", null);
 
     public WatchStatusResponse GetStatus()
     {
@@ -102,7 +119,7 @@ internal sealed class WatchSession
     {
         lock (_gate)
         {
-            if (!IsActive(_state))
+            if (!IsActiveState(_state))
             {
                 return null;
             }
@@ -143,13 +160,13 @@ internal sealed class WatchSession
         }
     }
 
-    private void Finish(WatchState state, string reason, string? error)
+    private bool Finish(WatchState state, string reason, string? error)
     {
         lock (_gate)
         {
-            if (!IsActive(_state))
+            if (!IsActiveState(_state))
             {
-                return;
+                return false;
             }
 
             _state = state;
@@ -157,9 +174,12 @@ internal sealed class WatchSession
             _error = error;
             _finishedAt = DateTimeOffset.UtcNow;
         }
+
+        _completionSource.TrySetResult();
+        return true;
     }
 
-    private static bool IsActive(WatchState state) =>
+    private static bool IsActiveState(WatchState state) =>
         state is WatchState.Starting or WatchState.Running;
 
     private static string FormatState(WatchState state) => state.ToString().ToLowerInvariant();

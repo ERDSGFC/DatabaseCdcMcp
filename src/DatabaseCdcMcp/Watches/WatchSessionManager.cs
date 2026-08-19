@@ -1,7 +1,7 @@
 using System.Collections.Concurrent;
+using System.Threading.Channels;
 using DatabaseCdcMcp.Configuration;
 using DatabaseCdcMcp.Domain;
-using DatabaseCdcMcp.MySql;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
@@ -12,14 +12,19 @@ namespace DatabaseCdcMcp.Watches;
 /// </summary>
 public sealed class WatchSessionManager
 {
-    private const int MaxConcurrentSessions = 1;
+    private const int MaxConcurrentSessions = 32;
     private static readonly TimeSpan MaxDuration = TimeSpan.FromHours(1);
     private const int MaxRetainedEvents = 100_000;
 
     private readonly ConcurrentDictionary<string, WatchSession> _sessions = new();
     private readonly SemaphoreSlim _sessionSlots = new(MaxConcurrentSessions, MaxConcurrentSessions);
-    
-    private readonly IMySqlChangeStreamFactory _changeStreamFactory;
+    private readonly Channel<bool> _activeSessionSignal = Channel.CreateBounded<bool>(
+        new BoundedChannelOptions(1)
+        {
+            SingleReader = true,
+            FullMode = BoundedChannelFullMode.DropWrite
+        });
+
     private readonly MySqlCdcSettings _settings;
     private readonly IHostApplicationLifetime _applicationLifetime;
     private readonly ILogger<WatchSessionManager> _logger;
@@ -27,17 +32,14 @@ public sealed class WatchSessionManager
     /// <summary>
     /// 创建一个对应已配置 MySQL 数据源的监听会话管理器。
     /// </summary>
-    /// <param name="changeStreamFactory">用于打开 Binlog 数据流的工厂。</param>
     /// <param name="settings">已读取并校验的 MySQL 连接配置。</param>
     /// <param name="applicationLifetime">用于在服务关闭时停止监听的 Host 生命周期对象。</param>
-    /// <param name="logger">用于记录后台监听任务异常的日志对象。</param>
+    /// <param name="logger">用于记录逻辑监听生命周期异常的日志对象。</param>
     public WatchSessionManager(
-        IMySqlChangeStreamFactory changeStreamFactory,
         MySqlCdcSettings settings,
         IHostApplicationLifetime applicationLifetime,
         ILogger<WatchSessionManager> logger)
     {
-        _changeStreamFactory = changeStreamFactory;
         _settings = settings;
         _applicationLifetime = applicationLifetime;
         _logger = logger;
@@ -82,7 +84,8 @@ public sealed class WatchSessionManager
             throw new WatchException("Failed to allocate a watch session.");
         }
 
-        _ = RunSessionAsync(session);
+        _ = RunSessionLifetimeAsync(session);
+        _activeSessionSignal.Writer.TryWrite(true);
 
         return new StartWatchResponse(
             id,
@@ -142,44 +145,18 @@ public sealed class WatchSessionManager
         return session.GetStatus();
     }
 
-    private async Task RunSessionAsync(WatchSession session)
+    private async Task RunSessionLifetimeAsync(WatchSession session)
     {
-        // 监听可能因为达到时长、主动停止或 Host 关闭而结束。
-        // 使用链接取消令牌，让 CDC 连接器统一感知这三种情况。
-        using var timeoutSource = new CancellationTokenSource(session.Request.Duration);
-        using var linkedSource = CancellationTokenSource.CreateLinkedTokenSource(
-            session.StopToken,
-            timeoutSource.Token,
-            _applicationLifetime.ApplicationStopping);
-
         try
         {
             session.MarkRunning();
-
-            await foreach (var change in _changeStreamFactory.ReadChangesAsync(
-                               session.Request,
-                               linkedSource.Token))
-            {
-                if (!session.AddEvent(change))
-                {
-                    session.Complete("max_events_reached");
-                    break;
-                }
-            }
-
-            if (!linkedSource.IsCancellationRequested)
-            {
-                session.Complete("stream_ended");
-            }
+            await session.Completion.WaitAsync(
+                session.Request.Duration,
+                _applicationLifetime.ApplicationStopping);
         }
-        // 将不同的取消原因转换为调用方可见的监听状态。
-        catch (OperationCanceledException) when (timeoutSource.IsCancellationRequested)
+        catch (TimeoutException)
         {
             session.Complete("duration_elapsed");
-        }
-        catch (OperationCanceledException) when (session.StopToken.IsCancellationRequested)
-        {
-            session.MarkStopped("stopped_by_user");
         }
         catch (OperationCanceledException) when (_applicationLifetime.ApplicationStopping.IsCancellationRequested)
         {
@@ -187,12 +164,61 @@ public sealed class WatchSessionManager
         }
         catch (Exception exception)
         {
-            _logger.LogError(exception, "MySQL watch {WatchId} failed", session.Id);
+            _logger.LogError(exception, "Watch session lifetime failed for {WatchId}.", session.Id);
             session.Fail(exception);
         }
         finally
         {
             _sessionSlots.Release();
+        }
+    }
+
+    internal async Task WaitForActiveSessionAsync(CancellationToken cancellationToken)
+    {
+        while (!HasActiveSessions())
+        {
+            await _activeSessionSignal.Reader.ReadAsync(cancellationToken);
+        }
+    }
+
+    private bool HasActiveSessions() =>
+        _sessions.Values.Any(session => session.IsActive);
+
+    internal bool ShouldCaptureTable(string database, string table) =>
+        _sessions.Values.Any(session => session.MatchesTarget(database, table));
+
+    internal void DispatchChange(DatabaseChange change)
+    {
+        foreach (var session in _sessions.Values)
+        {
+            if (session.TryAddEvent(change, out var reachedLimit) && reachedLimit)
+            {
+                session.Complete("max_events_reached");
+            }
+        }
+    }
+
+    internal void CompleteActiveSessions(string reason)
+    {
+        foreach (var session in _sessions.Values)
+        {
+            session.Complete(reason);
+        }
+    }
+
+    internal void StopActiveSessions(string reason)
+    {
+        foreach (var session in _sessions.Values)
+        {
+            session.MarkStopped(reason);
+        }
+    }
+
+    internal void FailActiveSessions(Exception exception)
+    {
+        foreach (var session in _sessions.Values)
+        {
+            session.Fail(exception);
         }
     }
 

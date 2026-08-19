@@ -17,16 +17,18 @@ public sealed class MySqlCdcChangeStreamFactory(MySqlCdcSettings settings)
     : IMySqlChangeStreamFactory
 {
     /// <summary>
-    /// 从当前 MySQL Binlog 末尾读取已提交的行变化。
+    /// 从当前 MySQL Binlog 末尾读取已提交的行变化，供所有逻辑监听共享。
     /// </summary>
-    /// <param name="request">数据库、表、操作类型和监听会话过滤条件。</param>
+    /// <param name="shouldCaptureTable">判断当前是否至少有一个逻辑监听需要指定表。</param>
     /// <param name="cancellationToken">监听结束时用于停止复制数据流。</param>
     /// <returns>标准化后的新增、更新和删除事件流。</returns>
     public async IAsyncEnumerable<DatabaseChange> ReadChangesAsync(
-        MySqlWatchRequest request,
+        Func<string, string, bool> shouldCaptureTable,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
-        var client = CreateClient(request.Database);
+        ArgumentNullException.ThrowIfNull(shouldCaptureTable);
+
+        var client = CreateClient();
 
         // Binlog 行事件通过内部数字 ID 引用表。
         // 保存最新的表映射，后续行事件才能按表名解析。
@@ -41,7 +43,7 @@ public sealed class MySqlCdcChangeStreamFactory(MySqlCdcSettings settings)
             if (binlogEvent is TableMapEvent tableMap)
             {
                 // 必须先读取表映射，才能解析该表后续的行事件。
-                if (!MatchesTarget(request, tableMap.DatabaseName, tableMap.TableName))
+                if (!shouldCaptureTable(tableMap.DatabaseName, tableMap.TableName))
                 {
                     tableMaps.Remove(tableMap.TableId);
                     continue;
@@ -66,9 +68,8 @@ public sealed class MySqlCdcChangeStreamFactory(MySqlCdcSettings settings)
             // 同时保留该事件对应的 Binlog 位点。
             switch (binlogEvent)
             {
-                case WriteRowsEvent writeRows
-                    when request.Operations.Contains(ChangeOperation.Insert) &&
-                         tableMaps.TryGetValue(writeRows.TableId, out var writeContext):
+                case WriteRowsEvent writeRows when
+                    tableMaps.TryGetValue(writeRows.TableId, out var writeContext):
                     foreach (var row in writeRows.Rows)
                     {
                         yield return CreateChange(
@@ -82,9 +83,8 @@ public sealed class MySqlCdcChangeStreamFactory(MySqlCdcSettings settings)
 
                     break;
 
-                case UpdateRowsEvent updateRows
-                    when request.Operations.Contains(ChangeOperation.Update) &&
-                         tableMaps.TryGetValue(updateRows.TableId, out var updateContext):
+                case UpdateRowsEvent updateRows when
+                    tableMaps.TryGetValue(updateRows.TableId, out var updateContext):
                     foreach (var row in updateRows.Rows)
                     {
                         yield return CreateChange(
@@ -98,9 +98,8 @@ public sealed class MySqlCdcChangeStreamFactory(MySqlCdcSettings settings)
 
                     break;
 
-                case DeleteRowsEvent deleteRows
-                    when request.Operations.Contains(ChangeOperation.Delete) &&
-                         tableMaps.TryGetValue(deleteRows.TableId, out var deleteContext):
+                case DeleteRowsEvent deleteRows when
+                    tableMaps.TryGetValue(deleteRows.TableId, out var deleteContext):
                     foreach (var row in deleteRows.Rows)
                     {
                         yield return CreateChange(
@@ -117,7 +116,7 @@ public sealed class MySqlCdcChangeStreamFactory(MySqlCdcSettings settings)
         }
     }
 
-    private BinlogClient CreateClient(string database)
+    private BinlogClient CreateClient()
     {
         return new BinlogClient(options =>
         {
@@ -125,7 +124,6 @@ public sealed class MySqlCdcChangeStreamFactory(MySqlCdcSettings settings)
             options.Port = settings.Port;
             options.Username = settings.Username;
             options.Password = settings.Password;
-            options.Database = database;
             options.ServerId = settings.ServerId;
             options.SslMode = SslMode.Disabled;
             options.Blocking = true;
@@ -193,15 +191,6 @@ public sealed class MySqlCdcChangeStreamFactory(MySqlCdcSettings settings)
         return Enumerable.Range(1, tableMap.ColumnTypes.Length)
             .Select(index => $"column_{index}")
             .ToArray();
-    }
-
-    /// <summary>
-    /// 应用监听请求中的数据库过滤条件和可选的表过滤条件。
-    /// </summary>
-    private static bool MatchesTarget(MySqlWatchRequest request, string database, string table)
-    {
-        return string.Equals(request.Database, database, StringComparison.OrdinalIgnoreCase) &&
-               (request.Tables.Count == 0 || request.Tables.Contains(table));
     }
 
     /// <summary>

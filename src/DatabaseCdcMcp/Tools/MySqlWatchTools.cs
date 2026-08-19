@@ -18,7 +18,8 @@ public static class MySqlWatchTools
     [Description(
         "Use this when the user wants to monitor future committed MySQL row changes. " +
         "Start the watch before the INSERT, UPDATE, or DELETE occurs. It reads only new " +
-        "row-level binlog events, not historical data, and only one watch session can run at a time.")]
+        "row-level binlog events, not historical data. Up to 32 logical watches can run " +
+        "concurrently and share one MySQL binlog connection.")]
     public static StartWatchResponse StartMysqlWatch(
         WatchSessionManager manager,
         [Description("Exact MySQL database name to monitor. The database must already exist and be accessible to the configured user.")] string database,
@@ -75,7 +76,7 @@ public static class MySqlWatchTools
         Idempotent = true,
         OpenWorld = false,
         UseStructuredContent = true)]
-    [Description("Lists the database, table filter, operation filter, and expiration time for the currently active watch. Use this to discover the active target without a watchId.")]
+    [Description("Lists the database, table filter, operation filter, and expiration time for all currently active watches. Use this to discover active targets without a watchId.")]
     public static WatchTargetsResponse GetMysqlWatchTargets(WatchSessionManager manager)
     {
         return manager.GetCurrentTargets();
