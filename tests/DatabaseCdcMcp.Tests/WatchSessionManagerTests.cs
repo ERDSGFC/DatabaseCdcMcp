@@ -107,26 +107,29 @@ public sealed class WatchSessionManagerTests
     }
 
     [Fact]
-    public void OversizedTransactionIsRejectedWithoutRetainingPartialChanges()
+    public async Task OversizedTransactionIsRejectedWithoutRetainingPartialChanges()
     {
-        var session = CreateSession(maxRetainedChanges: 10, maxChangesPerTransaction: 1);
         var transaction = CreateTransaction(
             "tx-1",
             CreateChange(ChangeOperation.Insert),
             CreateChange(ChangeOperation.Update));
+        await using var context = await CreateContextAsync(
+            new SequenceChangeStreamFactory([transaction]),
+            maxRetainedChanges: 10,
+            maxChangesPerTransaction: 1);
 
-        var result = session.TryAddTransaction(transaction);
+        var started = context.Manager.Start("demo", ["orders"], null, 30, 10);
+        var status = await WaitUntilFinishedAsync(context.Manager, started.WatchId);
 
-        Assert.Equal(AddTransactionResult.TransactionChangeLimitReached, result);
-        Assert.Empty(session.GetEvents(0, 10).Transactions);
-        Assert.Equal(0, session.GetStatus().TransactionCount);
-        Assert.Equal(0, session.GetStatus().ChangeCount);
+        Assert.Equal("transaction_change_limit_reached", status.FinishReason);
+        Assert.Empty(context.Manager.GetEvents(started.WatchId, 0, 10).Transactions);
+        Assert.Equal(0, status.TransactionCount);
+        Assert.Equal(0, status.ChangeCount);
     }
 
     [Fact]
-    public void WatchRetentionLimitRejectsTheNextWholeTransaction()
+    public async Task WatchRetentionLimitRejectsTheNextWholeTransaction()
     {
-        var session = CreateSession(maxRetainedChanges: 3, maxChangesPerTransaction: 3);
         var first = CreateTransaction(
             "tx-1",
             CreateChange(ChangeOperation.Insert),
@@ -135,17 +138,21 @@ public sealed class WatchSessionManagerTests
             "tx-2",
             CreateChange(ChangeOperation.Insert),
             CreateChange(ChangeOperation.Delete));
+        await using var context = await CreateContextAsync(
+            new SequenceChangeStreamFactory([first, second]),
+            maxRetainedChanges: 3,
+            maxChangesPerTransaction: 3);
 
-        Assert.Equal(AddTransactionResult.Added, session.TryAddTransaction(first));
-        Assert.Equal(
-            AddTransactionResult.WatchChangeLimitReached,
-            session.TryAddTransaction(second));
+        var started = context.Manager.Start("demo", ["orders"], null, 30, 10);
+        var status = await WaitUntilFinishedAsync(context.Manager, started.WatchId);
 
-        var retained = Assert.Single(session.GetEvents(0, 10).Transactions);
+        Assert.Equal("watch_change_limit_reached", status.FinishReason);
+        var retained = Assert.Single(
+            context.Manager.GetEvents(started.WatchId, 0, 10).Transactions);
         Assert.Equal("tx-1", retained.TransactionId);
         Assert.Equal(2, retained.Changes.Count);
-        Assert.Equal(1, session.GetStatus().TransactionCount);
-        Assert.Equal(2, session.GetStatus().ChangeCount);
+        Assert.Equal(1, status.TransactionCount);
+        Assert.Equal(2, status.ChangeCount);
     }
 
     [Fact]
@@ -206,8 +213,14 @@ public sealed class WatchSessionManagerTests
         factory.Publish(CreateTransaction("tx-delete", CreateChange(ChangeOperation.Delete, "orders")));
         factory.Publish(CreateTransaction(
             "tx-shared",
-            CreateChange(ChangeOperation.Insert, "orders"),
-            CreateChange(ChangeOperation.Update, "customers")));
+            CreateChange(
+                ChangeOperation.Insert,
+                "orders",
+                "INSERT INTO orders (id) VALUES (1)"),
+            CreateChange(
+                ChangeOperation.Update,
+                "customers",
+                "UPDATE customers SET active = 1 WHERE id = 1")));
 
         var ordersStatus = await WaitUntilFinishedAsync(manager, ordersWatch.WatchId);
         var customersStatus = await WaitUntilFinishedAsync(manager, customersWatch.WatchId);
@@ -221,12 +234,18 @@ public sealed class WatchSessionManagerTests
         var ordersEvent = Assert.Single(ordersTransaction.Changes);
         Assert.Equal("orders", ordersEvent.Table);
         Assert.Equal(ChangeOperation.Insert, ordersEvent.Operation);
+        Assert.Equal("INSERT INTO orders (id) VALUES (1)", ordersEvent.Query);
+        Assert.Equal("INSERT INTO orders (id) VALUES (1)", Assert.Single(ordersTransaction.Queries));
 
         var customersTransaction = Assert.Single(manager.GetEvents(customersWatch.WatchId, 0, 10).Transactions);
         Assert.Equal("tx-shared", customersTransaction.TransactionId);
         var customersEvent = Assert.Single(customersTransaction.Changes);
         Assert.Equal("customers", customersEvent.Table);
         Assert.Equal(ChangeOperation.Update, customersEvent.Operation);
+        Assert.Equal("UPDATE customers SET active = 1 WHERE id = 1", customersEvent.Query);
+        Assert.Equal(
+            "UPDATE customers SET active = 1 WHERE id = 1",
+            Assert.Single(customersTransaction.Queries));
     }
 
     [Fact]
@@ -274,17 +293,29 @@ public sealed class WatchSessionManagerTests
         Assert.Equal(2, factory.StreamCount);
     }
 
-    private static WatchSessionManager CreateManager()
+    private static WatchSessionManager CreateManager(
+        int maxRetainedChanges = MySqlCdcSettings.DefaultMaxRetainedChanges,
+        int maxChangesPerTransaction = MySqlCdcSettings.DefaultMaxChangesPerTransaction)
     {
         return new WatchSessionManager(
-            new MySqlCdcSettings("localhost", 3306, "cdc", "secret", 6_174),
+            new MySqlCdcSettings(
+                "localhost",
+                3306,
+                "cdc",
+                "secret",
+                6_174,
+                maxRetainedChanges,
+                maxChangesPerTransaction),
             new TestApplicationLifetime(),
             NullLogger<WatchSessionManager>.Instance);
     }
 
-    private static async Task<TestWatchContext> CreateContextAsync(IMySqlChangeStreamFactory factory)
+    private static async Task<TestWatchContext> CreateContextAsync(
+        IMySqlChangeStreamFactory factory,
+        int maxRetainedChanges = MySqlCdcSettings.DefaultMaxRetainedChanges,
+        int maxChangesPerTransaction = MySqlCdcSettings.DefaultMaxChangesPerTransaction)
     {
-        var manager = CreateManager();
+        var manager = CreateManager(maxRetainedChanges, maxChangesPerTransaction);
         var backgroundService = new MySqlChangeStreamBackgroundService(
             factory,
             manager,
@@ -293,7 +324,10 @@ public sealed class WatchSessionManagerTests
         return new TestWatchContext(manager, backgroundService);
     }
 
-    private static DatabaseChange CreateChange(ChangeOperation operation, string table = "orders")
+    private static DatabaseChange CreateChange(
+        ChangeOperation operation,
+        string table = "orders",
+        string? query = null)
     {
         return new DatabaseChange(
             0,
@@ -306,27 +340,8 @@ public sealed class WatchSessionManagerTests
             DateTimeOffset.UtcNow,
             "mysql-bin.000001",
             123,
-            null);
-    }
-
-    private static WatchSession CreateSession(
-        int maxTransactions = 10,
-        int maxRetainedChanges = 100,
-        int maxChangesPerTransaction = 100)
-    {
-        var request = new MySqlWatchRequest(
-            "demo",
-            new HashSet<string>(["orders"], StringComparer.OrdinalIgnoreCase),
-            new HashSet<ChangeOperation>(Enum.GetValues<ChangeOperation>()),
-            TimeSpan.FromMinutes(1),
-            maxTransactions);
-
-        return new WatchSession(
-            "watch-1",
-            request,
-            DateTimeOffset.UtcNow,
-            maxRetainedChanges,
-            maxChangesPerTransaction);
+            null,
+            query);
     }
 
     private static DatabaseTransaction CreateTransaction(
@@ -340,6 +355,7 @@ public sealed class WatchSessionManagerTests
             DateTimeOffset.UtcNow,
             "mysql-bin.000001",
             200,
+            changes.Select(change => change.Query).OfType<string>().ToArray(),
             changes);
     }
 

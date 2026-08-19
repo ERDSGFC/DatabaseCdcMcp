@@ -94,9 +94,17 @@ internal sealed class WatchSession(
                 })
                 .ToArray();
             var transactionSequence = _transactions.Count + 1L;
+            var matchingQueryTexts = matchingChanges
+                .Select(change => change.Query)
+                .OfType<string>()
+                .ToHashSet(StringComparer.Ordinal);
+            var matchingQueries = transaction.Queries
+                .Where(matchingQueryTexts.Contains)
+                .ToArray();
             _transactions.Add(transaction with
             {
                 Sequence = transactionSequence,
+                Queries = matchingQueries,
                 Changes = sequencedChanges
             });
             _changeCount += sequencedChanges.Length;

@@ -16,5 +16,7 @@ public sealed record DatabaseTransaction(
     string BinlogFile,
     [property: Description("Position of the next event after the transaction commit.")]
     long CommitPosition,
+    [property: Description("Original SQL statements recorded by Rows_query_log_event for this transaction, in Binlog order. Empty when binlog_rows_query_log_events is disabled or no statement was recorded.")]
+    IReadOnlyList<string> Queries,
     [property: Description("Captured row changes from this transaction, preserving Binlog order.")]
     IReadOnlyList<DatabaseChange> Changes);

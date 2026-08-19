@@ -38,7 +38,9 @@ public sealed class MySqlCdcChangeStreamFactory(MySqlCdcSettings settings)
         // 对同一个数据库和表只查询一次 INFORMATION_SCHEMA。
         var columnNameCache = new Dictionary<string, IReadOnlyList<string>>(StringComparer.OrdinalIgnoreCase);
         var pendingChanges = new List<DatabaseChange>();
+        var pendingQueries = new List<string>();
         string? currentGtid = null;
+        string? currentQuery = null;
 
         await foreach (var (header, binlogEvent) in client.Replicate(cancellationToken))
         {
@@ -47,7 +49,16 @@ public sealed class MySqlCdcChangeStreamFactory(MySqlCdcSettings settings)
                 // GTID marks the start of a new transaction group. Any uncommitted rows
                 // from a previous incomplete group must not leak into the new transaction.
                 pendingChanges.Clear();
+                pendingQueries.Clear();
                 currentGtid = gtidEvent.Gtid.ToString();
+                currentQuery = null;
+                continue;
+            }
+
+            if (binlogEvent is RowsQueryEvent rowsQueryEvent)
+            {
+                pendingQueries.Add(rowsQueryEvent.Query);
+                currentQuery = rowsQueryEvent.Query;
                 continue;
             }
 
@@ -57,13 +68,17 @@ public sealed class MySqlCdcChangeStreamFactory(MySqlCdcSettings settings)
                 if (statement.Equals("BEGIN", StringComparison.OrdinalIgnoreCase))
                 {
                     pendingChanges.Clear();
+                    pendingQueries.Clear();
+                    currentQuery = null;
                     continue;
                 }
 
                 if (statement.Equals("ROLLBACK", StringComparison.OrdinalIgnoreCase))
                 {
                     pendingChanges.Clear();
+                    pendingQueries.Clear();
                     currentGtid = null;
+                    currentQuery = null;
                     continue;
                 }
 
@@ -74,9 +89,12 @@ public sealed class MySqlCdcChangeStreamFactory(MySqlCdcSettings settings)
                         header,
                         xid: null,
                         currentGtid,
-                        pendingChanges);
+                        pendingChanges,
+                        pendingQueries);
                     pendingChanges.Clear();
+                    pendingQueries.Clear();
                     currentGtid = null;
+                    currentQuery = null;
 
                     if (transaction is not null)
                     {
@@ -94,9 +112,12 @@ public sealed class MySqlCdcChangeStreamFactory(MySqlCdcSettings settings)
                     header,
                     xidEvent.Xid,
                     currentGtid,
-                    pendingChanges);
+                    pendingChanges,
+                    pendingQueries);
                 pendingChanges.Clear();
+                pendingQueries.Clear();
                 currentGtid = null;
+                currentQuery = null;
 
                 if (transaction is not null)
                 {
@@ -144,7 +165,8 @@ public sealed class MySqlCdcChangeStreamFactory(MySqlCdcSettings settings)
                             writeContext,
                             ChangeOperation.Insert,
                             null,
-                            MapRow(writeContext.ColumnNames, row.Cells)));
+                            MapRow(writeContext.ColumnNames, row.Cells),
+                            currentQuery));
                     }
 
                     break;
@@ -159,7 +181,8 @@ public sealed class MySqlCdcChangeStreamFactory(MySqlCdcSettings settings)
                             updateContext,
                             ChangeOperation.Update,
                             MapRow(updateContext.ColumnNames, row.BeforeUpdate.Cells),
-                            MapRow(updateContext.ColumnNames, row.AfterUpdate.Cells)));
+                            MapRow(updateContext.ColumnNames, row.AfterUpdate.Cells),
+                            currentQuery));
                     }
 
                     break;
@@ -174,7 +197,8 @@ public sealed class MySqlCdcChangeStreamFactory(MySqlCdcSettings settings)
                             deleteContext,
                             ChangeOperation.Delete,
                             MapRow(deleteContext.ColumnNames, row.Cells),
-                            null));
+                            null,
+                            currentQuery));
                     }
 
                     break;
@@ -286,7 +310,8 @@ public sealed class MySqlCdcChangeStreamFactory(MySqlCdcSettings settings)
         TableContext context,
         ChangeOperation operation,
         IReadOnlyDictionary<string, object?>? before,
-        IReadOnlyDictionary<string, object?>? after)
+        IReadOnlyDictionary<string, object?>? after,
+        string? query)
     {
         var timestamp = header.Timestamp > 0
             ? DateTimeOffset.FromUnixTimeSeconds(header.Timestamp)
@@ -303,7 +328,8 @@ public sealed class MySqlCdcChangeStreamFactory(MySqlCdcSettings settings)
             timestamp,
             client.State.Filename,
             header.NextEventPosition,
-            null);
+            null,
+            query);
     }
 
     private static DatabaseTransaction? CreateTransaction(
@@ -311,7 +337,8 @@ public sealed class MySqlCdcChangeStreamFactory(MySqlCdcSettings settings)
         EventHeader commitHeader,
         long? xid,
         string? gtid,
-        IReadOnlyList<DatabaseChange> changes)
+        IReadOnlyList<DatabaseChange> changes,
+        IReadOnlyList<string> queries)
     {
         if (changes.Count == 0)
         {
@@ -333,6 +360,7 @@ public sealed class MySqlCdcChangeStreamFactory(MySqlCdcSettings settings)
             committedAt,
             binlogFile,
             commitHeader.NextEventPosition,
+            queries.ToArray(),
             changes.Select(change => change with { Gtid = gtid }).ToArray());
     }
 

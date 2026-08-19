@@ -41,11 +41,13 @@ dotnet test tests\DatabaseCdcMcp.Tests\DatabaseCdcMcp.Tests.csproj --no-restore
 
 ### 3.1 开启 ROW Binlog
 
-MySQL 必须使用行级 Binlog，并记录完整行数据：
+MySQL 必须使用行级 Binlog 并记录完整行数据。若要让 MCP 同时返回原始 SQL，还需开启 Rows query 事件：
 
 ```ini
 binlog_format=ROW
 binlog_row_image=FULL
+# 可选；开启后 transactions[].queries 和 changes[].query 才有内容
+binlog_rows_query_log_events=ON
 ```
 
 一个适用于 MySQL 5.7 的最小配置示例：
@@ -57,6 +59,7 @@ server_id=1
 log-bin=binlog
 binlog_format=ROW
 binlog_row_image=FULL
+binlog_rows_query_log_events=ON
 
 # Binlog 自动保留 7 天；按磁盘空间和业务需要调整
 expire_logs_days=7
@@ -86,6 +89,7 @@ MySQL 服务端和复制客户端不能使用相同的 `server_id`。
 SHOW VARIABLES LIKE 'log_bin';
 SHOW VARIABLES LIKE 'binlog_format';
 SHOW VARIABLES LIKE 'binlog_row_image';
+SHOW VARIABLES LIKE 'binlog_rows_query_log_events';
 SHOW VARIABLES LIKE 'expire_logs_days';
 SHOW VARIABLES LIKE 'server_id';
 SHOW MASTER STATUS;
@@ -469,6 +473,9 @@ COMMIT;
       "committedAt": "2026-08-17T10:00:30+00:00",
       "binlogFile": "mysql-bin.000001",
       "commitPosition": 1250,
+      "queries": [
+        "INSERT INTO demo.orders (id, customer_name) VALUES (1001, 'Tom')"
+      ],
       "changes": [
         {
           "sequence": 1,
@@ -484,7 +491,8 @@ COMMIT;
           "timestamp": "2026-08-17T10:00:30+00:00",
           "binlogFile": "mysql-bin.000001",
           "binlogPosition": 1234,
-          "gtid": null
+          "gtid": null,
+          "query": "INSERT INTO demo.orders (id, customer_name) VALUES (1001, 'Tom')"
         }
       ]
     }
@@ -621,6 +629,7 @@ COMMIT;
 - `transactionId`：事务标识；优先使用 GTID，未启用 GTID 时由提交 Binlog 位点和 XID 生成。
 - `committedAt`：事务提交时间。
 - `commitPosition`：事务提交事件后的 Binlog 位置。
+- `queries`：由 `Rows_query_log_event` 记录的事务原始 SQL，按 Binlog 顺序排列；未启用 `binlog_rows_query_log_events` 时为空数组。
 - `changes`：该事务中与监听过滤条件匹配的全部行变化，保持 Binlog 顺序。
 - `changes[].sequence`：会话内递增的行变化序号。
 - `eventId`：事件唯一标识，格式为 `watchId:sequence`。
@@ -631,6 +640,7 @@ COMMIT;
 - `timestamp`：Binlog 事件时间。
 - `binlogFile`、`binlogPosition`：事件在 MySQL Binlog 中的位置。
 - `gtid`：GTID 已启用时的事务标识，否则为空。
+- `query`：产生该行变化的原始 SQL；未启用 `binlog_rows_query_log_events` 时为空。SQL 可能包含敏感参数，调用方应按敏感数据处理。
 
 ## 10. 常见问题
 
