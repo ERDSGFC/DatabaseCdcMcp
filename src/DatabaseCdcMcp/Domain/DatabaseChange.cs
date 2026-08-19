@@ -1,3 +1,5 @@
+using System.ComponentModel;
+
 namespace DatabaseCdcMcp.Domain;
 
 /// <summary>
@@ -19,15 +21,27 @@ namespace DatabaseCdcMcp.Domain;
 /// <param name="BinlogFile">产生该事件的 Binlog 文件名。</param>
 /// <param name="BinlogPosition">该事件在 Binlog 中对应的下一事件位置。</param>
 /// <param name="Gtid">该事件所属的 GTID；服务器未启用 GTID 时为空。</param>
+[Description("A normalized MySQL row-change event captured from the binary log.")]
 public sealed record DatabaseChange(
+    [property: Description("Monotonically increasing sequence within the watch, starting at 1.")]
     long Sequence,
+    [property: Description("Stable event identifier composed from the watch identifier and sequence.")]
     string EventId,
+    [property: Description("Exact database name where the row changed.")]
     string Database,
+    [property: Description("Exact table name where the row changed.")]
     string Table,
+    [property: Description("Row operation: Insert, Update, or Delete.")]
     ChangeOperation Operation,
+    [property: Description("Column values before the change; null for an insert event.")]
     IReadOnlyDictionary<string, object?>? Before,
+    [property: Description("Column values after the change; null for a delete event.")]
     IReadOnlyDictionary<string, object?>? After,
+    [property: Description("MySQL binlog event timestamp in UTC; current UTC time is used if the source timestamp is unavailable.")]
     DateTimeOffset Timestamp,
+    [property: Description("MySQL binlog file containing the event; null when unavailable.")]
     string? BinlogFile,
+    [property: Description("Position of the next event in the MySQL binlog file.")]
     long BinlogPosition,
+    [property: Description("GTID associated with the event; null when GTID is disabled or unavailable.")]
     string? Gtid);
