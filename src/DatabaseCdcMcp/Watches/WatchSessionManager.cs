@@ -1,7 +1,7 @@
 using System.Collections.Concurrent;
+using System.Threading.Channels;
 using DatabaseCdcMcp.Configuration;
 using DatabaseCdcMcp.Domain;
-using DatabaseCdcMcp.MySql;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
@@ -18,10 +18,13 @@ public sealed class WatchSessionManager
 
     private readonly ConcurrentDictionary<string, WatchSession> _sessions = new();
     private readonly SemaphoreSlim _sessionSlots = new(MaxConcurrentSessions, MaxConcurrentSessions);
-    private readonly Lock _changeStreamGate = new();
-    private Task? _changeStreamTask;
+    private readonly Channel<bool> _activeSessionSignal = Channel.CreateBounded<bool>(
+        new BoundedChannelOptions(1)
+        {
+            SingleReader = true,
+            FullMode = BoundedChannelFullMode.DropWrite
+        });
 
-    private readonly IMySqlChangeStreamFactory _changeStreamFactory;
     private readonly MySqlCdcSettings _settings;
     private readonly IHostApplicationLifetime _applicationLifetime;
     private readonly ILogger<WatchSessionManager> _logger;
@@ -29,17 +32,14 @@ public sealed class WatchSessionManager
     /// <summary>
     /// 创建一个对应已配置 MySQL 数据源的监听会话管理器。
     /// </summary>
-    /// <param name="changeStreamFactory">用于打开 Binlog 数据流的工厂。</param>
     /// <param name="settings">已读取并校验的 MySQL 连接配置。</param>
     /// <param name="applicationLifetime">用于在服务关闭时停止监听的 Host 生命周期对象。</param>
-    /// <param name="logger">用于记录后台监听任务异常的日志对象。</param>
+    /// <param name="logger">用于记录逻辑监听生命周期异常的日志对象。</param>
     public WatchSessionManager(
-        IMySqlChangeStreamFactory changeStreamFactory,
         MySqlCdcSettings settings,
         IHostApplicationLifetime applicationLifetime,
         ILogger<WatchSessionManager> logger)
     {
-        _changeStreamFactory = changeStreamFactory;
         _settings = settings;
         _applicationLifetime = applicationLifetime;
         _logger = logger;
@@ -85,7 +85,7 @@ public sealed class WatchSessionManager
         }
 
         _ = RunSessionLifetimeAsync(session);
-        EnsureChangeStreamStarted();
+        _activeSessionSignal.Writer.TryWrite(true);
 
         return new StartWatchResponse(
             id,
@@ -162,68 +162,32 @@ public sealed class WatchSessionManager
         {
             session.MarkStopped("server_shutdown");
         }
+        catch (Exception exception)
+        {
+            _logger.LogError(exception, "Watch session lifetime failed for {WatchId}.", session.Id);
+            session.Fail(exception);
+        }
         finally
         {
             _sessionSlots.Release();
         }
     }
 
-    private void EnsureChangeStreamStarted()
+    internal async Task WaitForActiveSessionAsync(CancellationToken cancellationToken)
     {
-        lock (_changeStreamGate)
+        while (!HasActiveSessions())
         {
-            if (_changeStreamTask is null || _changeStreamTask.IsCompleted)
-            {
-                _changeStreamTask = RunChangeStreamAsync();
-            }
+            await _activeSessionSignal.Reader.ReadAsync(cancellationToken);
         }
     }
 
-    private async Task RunChangeStreamAsync()
-    {
-        try
-        {
-            await foreach (var change in _changeStreamFactory.ReadChangesAsync(
-                               ShouldCaptureTable,
-                               _applicationLifetime.ApplicationStopping))
-            {
-                DispatchChange(change);
-            }
+    private bool HasActiveSessions() =>
+        _sessions.Values.Any(session => session.IsActive);
 
-            if (!_applicationLifetime.ApplicationStopping.IsCancellationRequested)
-            {
-                CompleteActiveSessions("stream_ended");
-            }
-        }
-        catch (OperationCanceledException) when (_applicationLifetime.ApplicationStopping.IsCancellationRequested)
-        {
-            StopActiveSessions("server_shutdown");
-        }
-        catch (Exception exception)
-        {
-            _logger.LogError(exception, "The shared MySQL change stream failed.");
-            FailActiveSessions(exception);
-        }
-        finally
-        {
-            lock (_changeStreamGate)
-            {
-                _changeStreamTask = null;
-
-                // A watch may have been added while the previous stream was exiting.
-                if (!_applicationLifetime.ApplicationStopping.IsCancellationRequested &&
-                    _sessions.Values.Any(session => session.GetTarget() is not null))
-                {
-                    _changeStreamTask = RunChangeStreamAsync();
-                }
-            }
-        }
-    }
-
-    private bool ShouldCaptureTable(string database, string table) =>
+    internal bool ShouldCaptureTable(string database, string table) =>
         _sessions.Values.Any(session => session.MatchesTarget(database, table));
 
-    private void DispatchChange(DatabaseChange change)
+    internal void DispatchChange(DatabaseChange change)
     {
         foreach (var session in _sessions.Values)
         {
@@ -234,7 +198,7 @@ public sealed class WatchSessionManager
         }
     }
 
-    private void CompleteActiveSessions(string reason)
+    internal void CompleteActiveSessions(string reason)
     {
         foreach (var session in _sessions.Values)
         {
@@ -242,7 +206,7 @@ public sealed class WatchSessionManager
         }
     }
 
-    private void StopActiveSessions(string reason)
+    internal void StopActiveSessions(string reason)
     {
         foreach (var session in _sessions.Values)
         {
@@ -250,7 +214,7 @@ public sealed class WatchSessionManager
         }
     }
 
-    private void FailActiveSessions(Exception exception)
+    internal void FailActiveSessions(Exception exception)
     {
         foreach (var session in _sessions.Values)
         {

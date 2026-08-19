@@ -31,11 +31,22 @@ internal sealed class WatchSession
 
     public Task Completion => _completionSource.Task;
 
+    public bool IsActive
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return IsActiveState(_state);
+            }
+        }
+    }
+
     public bool MatchesTarget(string database, string table)
     {
         lock (_gate)
         {
-            return IsActive(_state) &&
+            return IsActiveState(_state) &&
                    string.Equals(Request.Database, database, StringComparison.OrdinalIgnoreCase) &&
                    (Request.Tables.Count == 0 || Request.Tables.Contains(table));
         }
@@ -47,7 +58,7 @@ internal sealed class WatchSession
         {
             reachedLimit = false;
 
-            if (!IsActive(_state) ||
+            if (!IsActiveState(_state) ||
                 !string.Equals(Request.Database, change.Database, StringComparison.OrdinalIgnoreCase) ||
                 (Request.Tables.Count > 0 && !Request.Tables.Contains(change.Table)) ||
                 !Request.Operations.Contains(change.Operation) ||
@@ -108,7 +119,7 @@ internal sealed class WatchSession
     {
         lock (_gate)
         {
-            if (!IsActive(_state))
+            if (!IsActiveState(_state))
             {
                 return null;
             }
@@ -153,7 +164,7 @@ internal sealed class WatchSession
     {
         lock (_gate)
         {
-            if (!IsActive(_state))
+            if (!IsActiveState(_state))
             {
                 return false;
             }
@@ -168,7 +179,7 @@ internal sealed class WatchSession
         return true;
     }
 
-    private static bool IsActive(WatchState state) =>
+    private static bool IsActiveState(WatchState state) =>
         state is WatchState.Starting or WatchState.Running;
 
     private static string FormatState(WatchState state) => state.ToString().ToLowerInvariant();

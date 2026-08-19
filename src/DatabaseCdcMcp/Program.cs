@@ -18,6 +18,7 @@ builder.Services.AddSingleton(MySqlCdcSettings.FromConfiguration(builder.Configu
 builder.Services.AddSingleton<IMySqlChangeStreamFactory, MySqlCdcChangeStreamFactory>();
 builder.Services.AddSingleton<MySqlQueryService>();
 builder.Services.AddSingleton<WatchSessionManager>();
+builder.Services.AddHostedService<MySqlChangeStreamBackgroundService>();
 
 builder.Services
     .AddMcpServer()

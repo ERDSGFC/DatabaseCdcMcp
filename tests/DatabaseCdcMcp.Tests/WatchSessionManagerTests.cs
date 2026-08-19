@@ -26,7 +26,7 @@ public sealed class WatchSessionManagerTests
     [Fact]
     public async Task OneHourDurationIsAccepted()
     {
-        var manager = CreateManager(new BlockingChangeStreamFactory());
+        var manager = CreateManager();
 
         var started = manager.Start("demo", null, null, 3_600, 100);
 
@@ -39,7 +39,7 @@ public sealed class WatchSessionManagerTests
     [Fact]
     public void DurationLongerThanOneHourIsRejected()
     {
-        var manager = CreateManager(new SequenceChangeStreamFactory([]));
+        var manager = CreateManager();
 
         var exception = Assert.Throws<WatchException>(() =>
             manager.Start("demo", null, null, 3_601, 100));
@@ -55,7 +55,8 @@ public sealed class WatchSessionManagerTests
             CreateChange(ChangeOperation.Insert),
             CreateChange(ChangeOperation.Update)
         };
-        var manager = CreateManager(new SequenceChangeStreamFactory(changes));
+        await using var context = await CreateContextAsync(new SequenceChangeStreamFactory(changes));
+        var manager = context.Manager;
 
         var started = manager.Start("demo", ["orders"], null, 30, 2);
         var status = await WaitUntilFinishedAsync(manager, started.WatchId);
@@ -78,7 +79,7 @@ public sealed class WatchSessionManagerTests
     [Fact]
     public void InvalidOperationIsRejectedBeforeStartingAStream()
     {
-        var manager = CreateManager(new SequenceChangeStreamFactory([]));
+        var manager = CreateManager();
 
         var exception = Assert.Throws<WatchException>(() =>
             manager.Start("demo", null, ["truncate"], 30, 100));
@@ -89,7 +90,7 @@ public sealed class WatchSessionManagerTests
     [Fact]
     public async Task ActiveWatchCanBeStopped()
     {
-        var manager = CreateManager(new BlockingChangeStreamFactory());
+        var manager = CreateManager();
         var started = manager.Start("demo", null, null, 30, 100);
 
         manager.Stop(started.WatchId);
@@ -102,7 +103,7 @@ public sealed class WatchSessionManagerTests
     [Fact]
     public async Task CurrentTargetsIncludeOnlyActiveWatch()
     {
-        var manager = CreateManager(new BlockingChangeStreamFactory());
+        var manager = CreateManager();
         var started = manager.Start("demo", ["orders", "customers"], ["insert", "update"], 30, 100);
 
         var targets = manager.GetCurrentTargets();
@@ -124,7 +125,8 @@ public sealed class WatchSessionManagerTests
     public async Task MultipleWatchesShareOneStreamAndReceiveOnlyMatchingEvents()
     {
         var factory = new ChannelChangeStreamFactory();
-        var manager = CreateManager(factory);
+        await using var context = await CreateContextAsync(factory);
+        var manager = context.Manager;
 
         var ordersWatch = manager.Start("demo", ["orders"], ["insert"], 30, 1);
         var customersWatch = manager.Start("demo", ["customers"], ["update"], 30, 1);
@@ -153,7 +155,8 @@ public sealed class WatchSessionManagerTests
     public async Task StoppingOneWatchDoesNotStopTheSharedStreamOrOtherWatches()
     {
         var factory = new ChannelChangeStreamFactory();
-        var manager = CreateManager(factory);
+        await using var context = await CreateContextAsync(factory);
+        var manager = context.Manager;
 
         var stoppedWatch = manager.Start("demo", ["orders"], null, 30, 10);
         var activeWatch = manager.Start("demo", ["customers"], null, 30, 1);
@@ -171,13 +174,45 @@ public sealed class WatchSessionManagerTests
         Assert.Single(manager.GetEvents(activeWatch.WatchId, 0, 10).Events);
     }
 
-    private static WatchSessionManager CreateManager(IMySqlChangeStreamFactory factory)
+    [Fact]
+    public async Task ImmediatelyCompletedStreamWaitsForAnotherWatchBeforeRestarting()
+    {
+        var factory = new CompletingChangeStreamFactory();
+        await using var context = await CreateContextAsync(factory);
+
+        var started = context.Manager.Start("demo", null, null, 30, 10);
+        var status = await WaitUntilFinishedAsync(context.Manager, started.WatchId);
+
+        await Task.Delay(50);
+
+        Assert.Equal("completed", status.State);
+        Assert.Equal("stream_ended", status.FinishReason);
+        Assert.Equal(1, factory.StreamCount);
+
+        var second = context.Manager.Start("demo", null, null, 30, 10);
+        var secondStatus = await WaitUntilFinishedAsync(context.Manager, second.WatchId);
+
+        Assert.Equal("stream_ended", secondStatus.FinishReason);
+        Assert.Equal(2, factory.StreamCount);
+    }
+
+    private static WatchSessionManager CreateManager()
     {
         return new WatchSessionManager(
-            factory,
             new MySqlCdcSettings("localhost", 3306, "cdc", "secret", 6_174),
             new TestApplicationLifetime(),
             NullLogger<WatchSessionManager>.Instance);
+    }
+
+    private static async Task<TestWatchContext> CreateContextAsync(IMySqlChangeStreamFactory factory)
+    {
+        var manager = CreateManager();
+        var backgroundService = new MySqlChangeStreamBackgroundService(
+            factory,
+            manager,
+            NullLogger<MySqlChangeStreamBackgroundService>.Instance);
+        await backgroundService.StartAsync(CancellationToken.None);
+        return new TestWatchContext(manager, backgroundService);
     }
 
     private static DatabaseChange CreateChange(ChangeOperation operation, string table = "orders")
@@ -270,6 +305,37 @@ public sealed class WatchSessionManagerTests
                     yield return change;
                 }
             }
+        }
+    }
+
+    private sealed class CompletingChangeStreamFactory : IMySqlChangeStreamFactory
+    {
+        private int _streamCount;
+
+        public int StreamCount => Volatile.Read(ref _streamCount);
+
+        public async IAsyncEnumerable<DatabaseChange> ReadChangesAsync(
+            Func<string, string, bool> shouldCaptureTable,
+            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            Interlocked.Increment(ref _streamCount);
+            cancellationToken.ThrowIfCancellationRequested();
+            await Task.Yield();
+            yield break;
+        }
+    }
+
+    private sealed class TestWatchContext(
+        WatchSessionManager manager,
+        MySqlChangeStreamBackgroundService backgroundService) : IAsyncDisposable
+    {
+        public WatchSessionManager Manager { get; } = manager;
+
+        public async ValueTask DisposeAsync()
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            await backgroundService.StopAsync(timeout.Token);
+            backgroundService.Dispose();
         }
     }
 
