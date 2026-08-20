@@ -21,6 +21,7 @@ namespace DatabaseCdcMcp.Domain;
 /// <param name="BinlogFile">产生该事件的 Binlog 文件名。</param>
 /// <param name="BinlogPosition">该事件在 Binlog 中对应的下一事件位置。</param>
 /// <param name="Gtid">该事件所属的 GTID；服务器未启用 GTID 时为空。</param>
+/// <param name="Query">产生该行变化的原始 SQL；服务器未记录 Rows_query_log_event 时为空。</param>
 [Description("A normalized MySQL row-change event captured from the binary log.")]
 public sealed record DatabaseChange(
     [property: Description("Monotonically increasing sequence within the watch, starting at 1.")]
@@ -44,4 +45,6 @@ public sealed record DatabaseChange(
     [property: Description("Position of the next event in the MySQL binlog file.")]
     long BinlogPosition,
     [property: Description("GTID associated with the event; null when GTID is disabled or unavailable.")]
-    string? Gtid);
+    string? Gtid,
+    [property: Description("Original SQL statement associated with this row change by Rows_query_log_event; null when binlog_rows_query_log_events is disabled or unavailable.")]
+    string? Query);

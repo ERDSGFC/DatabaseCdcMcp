@@ -22,11 +22,11 @@ public sealed class MySqlChangeStreamBackgroundService(
 
                 try
                 {
-                    await foreach (var change in changeStreamFactory.ReadChangesAsync(
+                    await foreach (var transaction in changeStreamFactory.ReadChangesAsync(
                                        sessionManager.ShouldCaptureTable,
                                        stoppingToken))
                     {
-                        sessionManager.DispatchChange(change);
+                        sessionManager.DispatchTransaction(transaction);
                     }
 
                     if (!stoppingToken.IsCancellationRequested)

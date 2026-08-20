@@ -22,7 +22,7 @@ public sealed class MySqlCdcChangeStreamFactory(MySqlCdcSettings settings)
     /// <param name="shouldCaptureTable">判断当前是否至少有一个逻辑监听需要指定表。</param>
     /// <param name="cancellationToken">监听结束时用于停止复制数据流。</param>
     /// <returns>标准化后的新增、更新和删除事件流。</returns>
-    public async IAsyncEnumerable<DatabaseChange> ReadChangesAsync(
+    public async IAsyncEnumerable<DatabaseTransaction> ReadChangesAsync(
         Func<string, string, bool> shouldCaptureTable,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
@@ -37,9 +37,96 @@ public sealed class MySqlCdcChangeStreamFactory(MySqlCdcSettings settings)
         // Binlog 中会重复携带表元数据。
         // 对同一个数据库和表只查询一次 INFORMATION_SCHEMA。
         var columnNameCache = new Dictionary<string, IReadOnlyList<string>>(StringComparer.OrdinalIgnoreCase);
+        var pendingChanges = new List<DatabaseChange>();
+        var pendingQueries = new List<string>();
+        string? currentGtid = null;
+        string? currentQuery = null;
 
         await foreach (var (header, binlogEvent) in client.Replicate(cancellationToken))
         {
+            if (binlogEvent is GtidEvent gtidEvent)
+            {
+                // GTID marks the start of a new transaction group. Any uncommitted rows
+                // from a previous incomplete group must not leak into the new transaction.
+                pendingChanges.Clear();
+                pendingQueries.Clear();
+                currentGtid = gtidEvent.Gtid.ToString();
+                currentQuery = null;
+                continue;
+            }
+
+            if (binlogEvent is RowsQueryEvent rowsQueryEvent)
+            {
+                pendingQueries.Add(rowsQueryEvent.Query);
+                currentQuery = rowsQueryEvent.Query;
+                continue;
+            }
+
+            if (binlogEvent is QueryEvent queryEvent)
+            {
+                var statement = queryEvent.SqlStatement.Trim();
+                if (statement.Equals("BEGIN", StringComparison.OrdinalIgnoreCase))
+                {
+                    pendingChanges.Clear();
+                    pendingQueries.Clear();
+                    currentQuery = null;
+                    continue;
+                }
+
+                if (statement.Equals("ROLLBACK", StringComparison.OrdinalIgnoreCase))
+                {
+                    pendingChanges.Clear();
+                    pendingQueries.Clear();
+                    currentGtid = null;
+                    currentQuery = null;
+                    continue;
+                }
+
+                if (statement.Equals("COMMIT", StringComparison.OrdinalIgnoreCase))
+                {
+                    var transaction = CreateTransaction(
+                        client,
+                        header,
+                        xid: null,
+                        currentGtid,
+                        pendingChanges,
+                        pendingQueries);
+                    pendingChanges.Clear();
+                    pendingQueries.Clear();
+                    currentGtid = null;
+                    currentQuery = null;
+
+                    if (transaction is not null)
+                    {
+                        yield return transaction;
+                    }
+
+                    continue;
+                }
+            }
+
+            if (binlogEvent is XidEvent xidEvent)
+            {
+                var transaction = CreateTransaction(
+                    client,
+                    header,
+                    xidEvent.Xid,
+                    currentGtid,
+                    pendingChanges,
+                    pendingQueries);
+                pendingChanges.Clear();
+                pendingQueries.Clear();
+                currentGtid = null;
+                currentQuery = null;
+
+                if (transaction is not null)
+                {
+                    yield return transaction;
+                }
+
+                continue;
+            }
+
             if (binlogEvent is TableMapEvent tableMap)
             {
                 // 必须先读取表映射，才能解析该表后续的行事件。
@@ -72,13 +159,14 @@ public sealed class MySqlCdcChangeStreamFactory(MySqlCdcSettings settings)
                     tableMaps.TryGetValue(writeRows.TableId, out var writeContext):
                     foreach (var row in writeRows.Rows)
                     {
-                        yield return CreateChange(
+                        pendingChanges.Add(CreateChange(
                             client,
                             header,
                             writeContext,
                             ChangeOperation.Insert,
                             null,
-                            MapRow(writeContext.ColumnNames, row.Cells));
+                            MapRow(writeContext.ColumnNames, row.Cells),
+                            currentQuery));
                     }
 
                     break;
@@ -87,13 +175,14 @@ public sealed class MySqlCdcChangeStreamFactory(MySqlCdcSettings settings)
                     tableMaps.TryGetValue(updateRows.TableId, out var updateContext):
                     foreach (var row in updateRows.Rows)
                     {
-                        yield return CreateChange(
+                        pendingChanges.Add(CreateChange(
                             client,
                             header,
                             updateContext,
                             ChangeOperation.Update,
                             MapRow(updateContext.ColumnNames, row.BeforeUpdate.Cells),
-                            MapRow(updateContext.ColumnNames, row.AfterUpdate.Cells));
+                            MapRow(updateContext.ColumnNames, row.AfterUpdate.Cells),
+                            currentQuery));
                     }
 
                     break;
@@ -102,13 +191,14 @@ public sealed class MySqlCdcChangeStreamFactory(MySqlCdcSettings settings)
                     tableMaps.TryGetValue(deleteRows.TableId, out var deleteContext):
                     foreach (var row in deleteRows.Rows)
                     {
-                        yield return CreateChange(
+                        pendingChanges.Add(CreateChange(
                             client,
                             header,
                             deleteContext,
                             ChangeOperation.Delete,
                             MapRow(deleteContext.ColumnNames, row.Cells),
-                            null);
+                            null,
+                            currentQuery));
                     }
 
                     break;
@@ -220,7 +310,8 @@ public sealed class MySqlCdcChangeStreamFactory(MySqlCdcSettings settings)
         TableContext context,
         ChangeOperation operation,
         IReadOnlyDictionary<string, object?>? before,
-        IReadOnlyDictionary<string, object?>? after)
+        IReadOnlyDictionary<string, object?>? after,
+        string? query)
     {
         var timestamp = header.Timestamp > 0
             ? DateTimeOffset.FromUnixTimeSeconds(header.Timestamp)
@@ -237,7 +328,40 @@ public sealed class MySqlCdcChangeStreamFactory(MySqlCdcSettings settings)
             timestamp,
             client.State.Filename,
             header.NextEventPosition,
-            client.State.GtidState?.ToString());
+            null,
+            query);
+    }
+
+    private static DatabaseTransaction? CreateTransaction(
+        BinlogClient client,
+        EventHeader commitHeader,
+        long? xid,
+        string? gtid,
+        IReadOnlyList<DatabaseChange> changes,
+        IReadOnlyList<string> queries)
+    {
+        if (changes.Count == 0)
+        {
+            return null;
+        }
+
+        var binlogFile = client.State.Filename ?? string.Empty;
+        var committedAt = commitHeader.Timestamp > 0
+            ? DateTimeOffset.FromUnixTimeSeconds(commitHeader.Timestamp)
+            : DateTimeOffset.UtcNow;
+        var transactionId = !string.IsNullOrWhiteSpace(gtid)
+            ? gtid
+            : $"{binlogFile}:{commitHeader.NextEventPosition}:xid:{xid?.ToString() ?? "unknown"}";
+
+        return new DatabaseTransaction(
+            0,
+            transactionId,
+            gtid,
+            committedAt,
+            binlogFile,
+            commitHeader.NextEventPosition,
+            queries.ToArray(),
+            changes.Select(change => change with { Gtid = gtid }).ToArray());
     }
 
     private sealed record TableContext(

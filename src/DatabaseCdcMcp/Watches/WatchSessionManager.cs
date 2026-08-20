@@ -14,7 +14,7 @@ public sealed class WatchSessionManager
 {
     private const int MaxConcurrentSessions = 32;
     private static readonly TimeSpan MaxDuration = TimeSpan.FromHours(1);
-    private const int MaxRetainedEvents = 100_000;
+    private const int MaxTransactionsPerWatch = 100_000;
 
     private readonly ConcurrentDictionary<string, WatchSession> _sessions = new();
     private readonly SemaphoreSlim _sessionSlots = new(MaxConcurrentSessions, MaxConcurrentSessions);
@@ -52,14 +52,14 @@ public sealed class WatchSessionManager
     /// <param name="tables">可选的表过滤条件；为空表示监听所有表。</param>
     /// <param name="operations">可选的新增、更新和删除操作过滤条件。</param>
     /// <param name="durationSeconds">监听的最长持续时间。</param>
-    /// <param name="maxEvents">最多保留的事件数量。</param>
+    /// <param name="maxTransactions">最多保留的完整事务数量。</param>
     /// <returns>新创建的监听会话信息。</returns>
     public StartWatchResponse Start(
         string database,
         IEnumerable<string>? tables,
         IEnumerable<string>? operations,
         int durationSeconds,
-        int maxEvents)
+        int maxTransactions)
     {
         if (!_settings.IsConfigured)
         {
@@ -67,7 +67,7 @@ public sealed class WatchSessionManager
                 "MySQL is not configured. Set MYSQL_CDC_HOST, MYSQL_CDC_USER and MYSQL_CDC_PASSWORD before starting the MCP server.");
         }
 
-        var request = NormalizeRequest(database, tables, operations, durationSeconds, maxEvents);
+        var request = NormalizeRequest(database, tables, operations, durationSeconds, maxTransactions);
 
         if (!_sessionSlots.Wait(0))
         {
@@ -76,7 +76,12 @@ public sealed class WatchSessionManager
 
         var id = Guid.NewGuid().ToString("N");
         var startedAt = DateTimeOffset.UtcNow;
-        var session = new WatchSession(id, request, startedAt);
+        var session = new WatchSession(
+            id,
+            request,
+            startedAt,
+            _settings.MaxRetainedChanges,
+            _settings.MaxChangesPerTransaction);
 
         if (!_sessions.TryAdd(id, session))
         {
@@ -92,11 +97,11 @@ public sealed class WatchSessionManager
             "starting",
             startedAt,
             session.ExpiresAt,
-            request.MaxEvents);
+            request.MaxTransactions);
     }
 
     /// <summary>
-    /// 读取指定序号之后的一页事件。
+    /// 读取指定事务序号之后的一页完整事务。
     /// </summary>
     public WatchEventsResponse GetEvents(string watchId, long afterSequence, int limit)
     {
@@ -187,13 +192,21 @@ public sealed class WatchSessionManager
     internal bool ShouldCaptureTable(string database, string table) =>
         _sessions.Values.Any(session => session.MatchesTarget(database, table));
 
-    internal void DispatchChange(DatabaseChange change)
+    internal void DispatchTransaction(DatabaseTransaction transaction)
     {
         foreach (var session in _sessions.Values)
         {
-            if (session.TryAddEvent(change, out var reachedLimit) && reachedLimit)
+            switch (session.TryAddTransaction(transaction))
             {
-                session.Complete("max_events_reached");
+                case AddTransactionResult.MaxTransactionsReached:
+                    session.Complete("max_transactions_reached");
+                    break;
+                case AddTransactionResult.TransactionChangeLimitReached:
+                    session.Complete("transaction_change_limit_reached");
+                    break;
+                case AddTransactionResult.WatchChangeLimitReached:
+                    session.Complete("watch_change_limit_reached");
+                    break;
             }
         }
     }
@@ -243,7 +256,7 @@ public sealed class WatchSessionManager
         IEnumerable<string>? tables,
         IEnumerable<string>? operations,
         int durationSeconds,
-        int maxEvents)
+        int maxTransactions)
     {
         if (string.IsNullOrWhiteSpace(database))
         {
@@ -255,9 +268,10 @@ public sealed class WatchSessionManager
             throw new WatchException($"durationSeconds must be between 1 and {(int)MaxDuration.TotalSeconds}.");
         }
 
-        if (maxEvents is < 1 or > MaxRetainedEvents)
+        if (maxTransactions is < 1 or > MaxTransactionsPerWatch)
         {
-            throw new WatchException($"maxEvents must be between 1 and {MaxRetainedEvents}.");
+            throw new WatchException(
+                $"maxTransactions must be between 1 and {MaxTransactionsPerWatch}.");
         }
 
         var normalizedTables = new HashSet<string>(
@@ -290,6 +304,6 @@ public sealed class WatchSessionManager
             normalizedTables,
             normalizedOperations,
             TimeSpan.FromSeconds(durationSeconds),
-            maxEvents);
+            maxTransactions);
     }
 }

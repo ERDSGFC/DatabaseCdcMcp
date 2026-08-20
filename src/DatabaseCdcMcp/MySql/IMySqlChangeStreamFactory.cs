@@ -4,7 +4,7 @@ namespace DatabaseCdcMcp.MySql;
 
 public interface IMySqlChangeStreamFactory
 {
-    IAsyncEnumerable<DatabaseChange> ReadChangesAsync(
+    IAsyncEnumerable<DatabaseTransaction> ReadChangesAsync(
         Func<string, string, bool> shouldCaptureTable,
         CancellationToken cancellationToken);
 }

@@ -12,8 +12,9 @@
 - 事件只保存在内存中，程序重启后不会恢复。
 - 同一时间最多运行 32 个逻辑监听会话，所有会话共享同一个 MySQL Binlog 连接和复制客户端 `server_id`。
 - 单次监听时间范围为 1 到 3600 秒（最长 1 小时），默认 600 秒（10 分钟）。
-- 单个会话最多保留 100000 条事件。
-- 单次读取最多返回 1000 条事件。
+- 单个会话最多保留 100000 个完整事务；默认上限为 1000 个事务。
+- 为避免异常大事务耗尽内存，内部还限制单事务最多 10000 行变化、单监听最多累计 100000 行变化；达到保护上限时不会保存部分事务。
+- 单次读取最多返回 1000 个完整事务。
 - 监听不会自动提供初始全量快照；如需读取现有数据，可调用表数据查询工具。当前也不监听 DDL 变化。
 
 ## 2. 准备环境
@@ -40,11 +41,13 @@ dotnet test tests\DatabaseCdcMcp.Tests\DatabaseCdcMcp.Tests.csproj --no-restore
 
 ### 3.1 开启 ROW Binlog
 
-MySQL 必须使用行级 Binlog，并记录完整行数据：
+MySQL 必须使用行级 Binlog 并记录完整行数据。若要让 MCP 同时返回原始 SQL，还需开启 Rows query 事件：
 
 ```ini
 binlog_format=ROW
 binlog_row_image=FULL
+# 可选；开启后 transactions[].queries 和 changes[].query 才有内容
+binlog_rows_query_log_events=ON
 ```
 
 一个适用于 MySQL 5.7 的最小配置示例：
@@ -56,6 +59,7 @@ server_id=1
 log-bin=binlog
 binlog_format=ROW
 binlog_row_image=FULL
+binlog_rows_query_log_events=ON
 
 # Binlog 自动保留 7 天；按磁盘空间和业务需要调整
 expire_logs_days=7
@@ -85,6 +89,7 @@ MySQL 服务端和复制客户端不能使用相同的 `server_id`。
 SHOW VARIABLES LIKE 'log_bin';
 SHOW VARIABLES LIKE 'binlog_format';
 SHOW VARIABLES LIKE 'binlog_row_image';
+SHOW VARIABLES LIKE 'binlog_rows_query_log_events';
 SHOW VARIABLES LIKE 'expire_logs_days';
 SHOW VARIABLES LIKE 'server_id';
 SHOW MASTER STATUS;
@@ -96,10 +101,35 @@ SHOW MASTER STATUS;
 - `log_bin` 为 `ON`
 - `binlog_format` 为 `ROW`
 - `binlog_row_image` 为 `FULL`
+- `binlog_rows_query_log_events` 为 `ON`（需要返回原始 SQL 时）
 - `server_id` 为非零值，并且与 MCP 使用的 `MYSQL_CDC_SERVER_ID` 不同
 - `expire_logs_days` 为你期望的保留天数
 
 如果配置不正确，请在 MySQL 配置文件的 `[mysqld]` 节中加入上面的配置并重启 MySQL。具体配置文件位置取决于你的安装方式。
+
+### 临时启用原始 SQL 记录
+
+如果暂时不想修改 MySQL 配置文件，可以使用具有动态系统变量修改权限的账号执行：
+
+```sql
+SET GLOBAL binlog_rows_query_log_events = ON;
+```
+
+该设置会立即对之后写入 Binlog 的行变化生效。它不会补写已经存在的 Binlog 事件，也不会自动关联已经发生的事务；请先执行这条命令，再启动 MCP 监听并执行新的提交事务。
+
+可以检查当前值：
+
+```sql
+SHOW GLOBAL VARIABLES LIKE 'binlog_rows_query_log_events';
+```
+
+如果结果为 `ON`，后续 MCP 返回的 `transactions[].queries` 和 `changes[].query` 才会有原始 SQL。该设置通常在 MySQL 重启后恢复，因此需要长期启用时，仍应把下面配置写入 `[mysqld]`：
+
+```ini
+binlog_rows_query_log_events=ON
+```
+
+执行 `SET GLOBAL` 需要相应的系统变量修改权限；权限不足时请使用管理员账号操作。原始 SQL 可能包含敏感参数，生产环境启用前应评估 Binlog 和 MCP 返回数据的访问范围。
 
 也可以临时修改 Binlog 过期天数：
 
@@ -246,7 +276,9 @@ D:\desktop\DatabaseCdcMcp\artifacts\win-x64\DatabaseCdcMcp.exe
         "MYSQL_CDC_PORT": "3306",
         "MYSQL_CDC_USER": "cdc_user",
         "MYSQL_CDC_PASSWORD": "replace-with-a-strong-password",
-        "MYSQL_CDC_SERVER_ID": "6174"
+        "MYSQL_CDC_SERVER_ID": "6174",
+        "MYSQL_CDC_MAX_RETAINED_CHANGES": "100000",
+        "MYSQL_CDC_MAX_CHANGES_PER_TRANSACTION": "10000"
       }
     }
   }
@@ -254,6 +286,13 @@ D:\desktop\DatabaseCdcMcp\artifacts\win-x64\DatabaseCdcMcp.exe
 ```
 
 在 JSON 中 Windows 反斜杠必须写成 `\\`。`MYSQL_CDC_SERVER_ID` 是复制客户端 ID，同一个 MySQL 实例上不要让多个复制客户端使用相同的 ID。
+
+两个内存保护变量均可省略：
+
+- `MYSQL_CDC_MAX_RETAINED_CHANGES`：单个监听累计允许保存的最大行变化数，默认 `100000`。
+- `MYSQL_CDC_MAX_CHANGES_PER_TRANSACTION`：单个事务允许保存的最大匹配行变化数，默认 `10000`，不能大于前者。
+
+两者必须是正整数。配置无效时 MCP Server 会拒绝启动；修改后需要重启 MCP Server。它们是服务级保护配置，不会出现在 `start_mysql_watch` 的工具参数中。
 
 保存配置后，完全退出并重新打开桌面 MCP 客户端，使它重新启动 MCP Server。连接成功后，客户端应该能发现以下八个工具：
 
@@ -297,6 +336,8 @@ MYSQL_CDC_PORT = "3306"
 MYSQL_CDC_USER = "cdc_user"
 MYSQL_CDC_PASSWORD = "replace-with-a-strong-password"
 MYSQL_CDC_SERVER_ID = "6174"
+MYSQL_CDC_MAX_RETAINED_CHANGES = "100000"
+MYSQL_CDC_MAX_CHANGES_PER_TRANSACTION = "10000"
 ```
 
 将 `command` 改为实际的 `DatabaseCdcMcp.exe` 绝对路径，将账号和密码改为实际值。`MYSQL_CDC_SERVER_ID` 必须与 MySQL 的 `server_id` 不同，例如 MySQL 使用 `server_id=1` 时，MCP 可以使用 `6174`。
@@ -334,7 +375,9 @@ get_mysql_table_data
     "MYSQL_CDC_PORT": "3306",
     "MYSQL_CDC_USER": "cdc_user",
     "MYSQL_CDC_PASSWORD": "replace-with-a-strong-password",
-    "MYSQL_CDC_SERVER_ID": "6174"
+    "MYSQL_CDC_SERVER_ID": "6174",
+    "MYSQL_CDC_MAX_RETAINED_CHANGES": "100000",
+    "MYSQL_CDC_MAX_CHANGES_PER_TRANSACTION": "10000"
   }
 }
 ```
@@ -348,7 +391,7 @@ get_mysql_table_data
 可以直接告诉 MCP 客户端：
 
 ```text
-请监听 demo 数据库的 orders 表 120 秒，只监听 insert 和 update，最多保留 100 条事件。
+请监听 demo 数据库的 orders 表 120 秒，只监听 insert 和 update，最多保留 100 个事务。
 ```
 
 客户端应调用 `start_mysql_watch`，对应参数如下：
@@ -359,7 +402,7 @@ get_mysql_table_data
   "tables": ["orders"],
   "operations": ["insert", "update"],
   "durationSeconds": 120,
-  "maxEvents": 100
+  "maxTransactions": 100
 }
 ```
 
@@ -371,7 +414,7 @@ get_mysql_table_data
   "state": "starting",
   "startedAt": "2026-08-17T10:00:00+00:00",
   "expiresAt": "2026-08-17T10:02:00+00:00",
-  "maxEvents": 100
+  "maxTransactions": 100
 }
 ```
 
@@ -429,7 +472,7 @@ WHERE id = 1001;
 COMMIT;
 ```
 
-### 第四步：读取事件
+### 第四步：按事务读取事件
 
 调用 `get_mysql_watch_events`：
 
@@ -447,22 +490,36 @@ COMMIT;
 {
   "watchId": "a1b2c3d4...",
   "state": "running",
-  "events": [
+  "transactions": [
     {
       "sequence": 1,
-      "eventId": "a1b2c3d4...:1",
-      "database": "demo",
-      "table": "orders",
-      "operation": "insert",
-      "before": null,
-      "after": {
-        "id": 1001,
-        "customer_name": "Tom"
-      },
-      "timestamp": "2026-08-17T10:00:30+00:00",
+      "transactionId": "mysql-bin.000001:1250:xid:42",
+      "gtid": null,
+      "committedAt": "2026-08-17T10:00:30+00:00",
       "binlogFile": "mysql-bin.000001",
-      "binlogPosition": 1234,
-      "gtid": null
+      "commitPosition": 1250,
+      "queries": [
+        "INSERT INTO demo.orders (id, customer_name) VALUES (1001, 'Tom')"
+      ],
+      "changes": [
+        {
+          "sequence": 1,
+          "eventId": "a1b2c3d4...:1",
+          "database": "demo",
+          "table": "orders",
+          "operation": "insert",
+          "before": null,
+          "after": {
+            "id": 1001,
+            "customer_name": "Tom"
+          },
+          "timestamp": "2026-08-17T10:00:30+00:00",
+          "binlogFile": "mysql-bin.000001",
+          "binlogPosition": 1234,
+          "gtid": null,
+          "query": "INSERT INTO demo.orders (id, customer_name) VALUES (1001, 'Tom')"
+        }
+      ]
     }
   ],
   "nextSequence": 1,
@@ -482,7 +539,7 @@ COMMIT;
 }
 ```
 
-当 `hasMore` 为 `true` 时继续读取；为 `false` 时表示当前已经没有更多已保存事件。监听仍可能处于 `running` 状态，需要稍后再次查询。
+`afterSequence` 和 `limit` 都以事务为单位。一个事务中的 `changes` 不会跨页拆分。当 `hasMore` 为 `true` 时继续读取；为 `false` 时表示当前已经没有更多已保存事务。监听仍可能处于 `running` 状态，需要稍后再次查询。
 
 ### 第六步：查询监听状态
 
@@ -494,13 +551,15 @@ COMMIT;
 }
 ```
 
+返回结果中的 `transactionCount` 是已完整保存的事务数，`changeCount` 是这些事务中匹配的行变化总数。达到 `maxTransactions` 后，`finishReason` 为 `max_transactions_reached`。如果触发内部内存保护，则分别为 `transaction_change_limit_reached` 或 `watch_change_limit_reached`，触发保护的事务不会被部分保存。
+
 常见状态如下：
 
 | 状态 | 含义 |
 |---|---|
 | `starting` | 已创建会话，后台监听尚未完全开始 |
 | `running` | 正在读取 Binlog |
-| `completed` | 正常完成、达到时长或达到事件数量上限 |
+| `completed` | 正常完成、达到时长、事务数量上限或内部内存保护上限 |
 | `stopped` | 用户主动停止或服务关闭 |
 | `faulted` | 连接、权限或其他运行错误 |
 
@@ -526,15 +585,15 @@ COMMIT;
 | `tables` | 否 | 表名数组；为空表示该数据库的所有表 |
 | `operations` | 否 | `insert`、`update`、`delete`；为空表示全部操作 |
 | `durationSeconds` | 否 | 监听时间，1 到 3600 秒，默认 600 秒（10 分钟） |
-| `maxEvents` | 否 | 会话最多保留的事件数，1 到 100000，默认 1000 |
+| `maxTransactions` | 否 | 完整事务数量上限，1 到 100000，默认 1000 |
 
 ### `get_mysql_watch_events`
 
 | 参数 | 必填 | 说明 |
 |---|---:|---|
 | `watchId` | 是 | `start_mysql_watch` 返回的 ID |
-| `afterSequence` | 否 | 读取该序号之后的事件，默认 0 |
-| `limit` | 否 | 本次最多返回 1000 条，默认 100 条 |
+| `afterSequence` | 否 | 读取该事务序号之后的完整事务，默认 0 |
+| `limit` | 否 | 本次最多返回的完整事务数，最大 1000，默认 100 |
 
 ### `get_mysql_watch_targets`
 
@@ -589,9 +648,15 @@ COMMIT;
 
 返回结果包含 `columns`、`rows`、`nextOffset` 和 `hasMore`。查询账号需要目标数据库表的 `SELECT` 权限。
 
-## 9. 事件字段说明
+## 9. 事务和事件字段说明
 
-- `sequence`：会话内递增序号，用于分页。
+- `transactions[].sequence`：会话内递增的事务序号，用于分页。
+- `transactionId`：事务标识；优先使用 GTID，未启用 GTID 时由提交 Binlog 位点和 XID 生成。
+- `committedAt`：事务提交时间。
+- `commitPosition`：事务提交事件后的 Binlog 位置。
+- `queries`：由 `Rows_query_log_event` 记录的事务原始 SQL，按 Binlog 顺序排列；未启用 `binlog_rows_query_log_events` 时为空数组。
+- `changes`：该事务中与监听过滤条件匹配的全部行变化，保持 Binlog 顺序。
+- `changes[].sequence`：会话内递增的行变化序号。
 - `eventId`：事件唯一标识，格式为 `watchId:sequence`。
 - `database`、`table`：发生变化的数据库和表。
 - `operation`：`insert`、`update` 或 `delete`。
@@ -600,6 +665,7 @@ COMMIT;
 - `timestamp`：Binlog 事件时间。
 - `binlogFile`、`binlogPosition`：事件在 MySQL Binlog 中的位置。
 - `gtid`：GTID 已启用时的事务标识，否则为空。
+- `query`：产生该行变化的原始 SQL；未启用 `binlog_rows_query_log_events` 时为空。SQL 可能包含敏感参数，调用方应按敏感数据处理。
 
 ## 10. 常见问题
 
@@ -622,6 +688,8 @@ MYSQL_CDC_PORT
 MYSQL_CDC_USER
 MYSQL_CDC_PASSWORD
 MYSQL_CDC_SERVER_ID
+MYSQL_CDC_MAX_RETAINED_CHANGES
+MYSQL_CDC_MAX_CHANGES_PER_TRANSACTION
 ```
 
 密码不会作为 MCP tool 参数传递。
