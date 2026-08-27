@@ -40,7 +40,7 @@ public sealed record DatabaseChange(
     IReadOnlyDictionary<string, object?>? After,
     [property: Description("MySQL binlog event timestamp in UTC; current UTC time is used if the source timestamp is unavailable.")]
     DateTimeOffset Timestamp,
-    [property: Description("MySQL binlog file containing the event; null when unavailable.")]
+    [property: Description("MySQL binlog file cThe requested watch session does not existontaining the event; null when unavailable.")]
     string? BinlogFile,
     [property: Description("Position of the next event in the MySQL binlog file.")]
     long BinlogPosition,

@@ -180,6 +180,41 @@ public sealed class WatchSessionManagerTests
     }
 
     [Fact]
+    public async Task AllSessionsIncludeFinishedWatchUntilDeleted()
+    {
+        var manager = CreateManager();
+        var started = manager.Start("demo", ["orders"], null, 30, 100);
+
+        manager.Stop(started.WatchId);
+        await WaitUntilFinishedAsync(manager, started.WatchId);
+
+        var sessions = manager.GetAllSessions();
+        var session = Assert.Single(sessions.Sessions);
+        Assert.Equal(started.WatchId, session.WatchId);
+        Assert.Equal("stopped", session.State);
+
+        manager.Delete(started.WatchId);
+        Assert.Empty(manager.GetAllSessions().Sessions);
+        Assert.Throws<WatchException>(() => manager.GetStatus(started.WatchId));
+    }
+
+    [Fact]
+    public async Task DeletingActiveWatchStopsItAndRemovesCapturedData()
+    {
+        var factory = new ChannelChangeStreamFactory();
+        await using var context = await CreateContextAsync(factory);
+        var started = context.Manager.Start("demo", ["orders"], null, 30, 100);
+
+        factory.Publish(CreateTransaction("tx-1", CreateChange(ChangeOperation.Insert)));
+        await WaitUntilCapturedAsync(context.Manager, started.WatchId);
+
+        context.Manager.Delete(started.WatchId);
+
+        Assert.Empty(context.Manager.GetAllSessions().Sessions);
+        Assert.Throws<WatchException>(() => context.Manager.GetEvents(started.WatchId, 0, 10));
+    }
+
+    [Fact]
     public async Task CurrentTargetsIncludeOnlyActiveWatch()
     {
         var manager = CreateManager();
@@ -377,6 +412,25 @@ public sealed class WatchSessionManagerTests
         }
 
         throw new TimeoutException("The watch did not finish in time.");
+    }
+
+    private static async Task WaitUntilCapturedAsync(
+        WatchSessionManager manager,
+        string watchId)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+
+        while (!timeout.IsCancellationRequested)
+        {
+            if (manager.GetStatus(watchId).ChangeCount > 0)
+            {
+                return;
+            }
+
+            await Task.Delay(10, timeout.Token);
+        }
+
+        throw new TimeoutException("The watch did not capture an event in time.");
     }
 
     private sealed class SequenceChangeStreamFactory(IEnumerable<DatabaseTransaction> transactions)
