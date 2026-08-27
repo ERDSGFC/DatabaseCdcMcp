@@ -294,14 +294,16 @@ D:\desktop\DatabaseCdcMcp\artifacts\win-x64\DatabaseCdcMcp.exe
 
 两者必须是正整数。配置无效时 MCP Server 会拒绝启动；修改后需要重启 MCP Server。它们是服务级保护配置，不会出现在 `start_mysql_watch` 的工具参数中。
 
-保存配置后，完全退出并重新打开桌面 MCP 客户端，使它重新启动 MCP Server。连接成功后，客户端应该能发现以下八个工具：
+保存配置后，完全退出并重新打开桌面 MCP 客户端，使它重新启动 MCP Server。连接成功后，客户端应该能发现以下十个工具：
 
 ```text
 start_mysql_watch
 get_mysql_watch_events
 get_mysql_watch_status
+get_mysql_watch_sessions
 get_mysql_watch_targets
 stop_mysql_watch
+delete_mysql_watch
 get_mysql_tables
 get_mysql_table_schema
 get_mysql_table_data
@@ -348,8 +350,10 @@ MYSQL_CDC_MAX_CHANGES_PER_TRANSACTION = "10000"
 start_mysql_watch
 get_mysql_watch_events
 get_mysql_watch_status
+get_mysql_watch_sessions
 get_mysql_watch_targets
 stop_mysql_watch
+delete_mysql_watch
 get_mysql_tables
 get_mysql_table_schema
 get_mysql_table_data
@@ -598,6 +602,14 @@ COMMIT;
 ### `get_mysql_watch_targets`
 
 不需要参数。返回当前活动监听的数据库、表过滤条件、操作过滤条件和有效期。`watches` 为空表示没有处于 `starting` 或 `running` 状态的监听。
+
+### `get_mysql_watch_sessions`
+
+不需要参数。返回当前进程内保留的所有会话，包括 `starting`、`running`、`completed`、`stopped` 和 `faulted` 状态。已结束会话仍可使用其 `watchId` 查询状态和已保存事务。
+
+### `delete_mysql_watch`
+
+需要传入 `watchId`。删除指定会话及其已保存的事务数据；活动会话会先停止。删除后该 `watchId` 不再有效，无法继续查询状态或事件。
 
 ### `get_mysql_watch_status` 和 `stop_mysql_watch`
 

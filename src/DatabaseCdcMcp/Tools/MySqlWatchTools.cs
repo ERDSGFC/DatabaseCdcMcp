@@ -70,6 +70,20 @@ public static class MySqlWatchTools
     }
 
     [McpServerTool(
+        Name = "get_mysql_watch_sessions",
+        Title = "Get all MySQL watch sessions",
+        ReadOnly = true,
+        Destructive = false,
+        Idempotent = true,
+        OpenWorld = false,
+        UseStructuredContent = true)]
+    [Description("Lists every MySQL watch session retained in memory, including running, completed, stopped, and faulted sessions. Use get_mysql_watch_events with a retained watchId to read captured transactions.")]
+    public static WatchSessionsResponse GetMysqlWatchSessions(WatchSessionManager manager)
+    {
+        return manager.GetAllSessions();
+    }
+
+    [McpServerTool(
         Name = "get_mysql_watch_targets",
         Title = "Get current MySQL watch targets",
         ReadOnly = true,
@@ -99,11 +113,40 @@ public static class MySqlWatchTools
         return Invoke(() => manager.Stop(watchId));
     }
 
+    [McpServerTool(
+        Name = "delete_mysql_watch",
+        Title = "Delete MySQL watch",
+        ReadOnly = false,
+        Destructive = true,
+        Idempotent = false,
+        OpenWorld = false,
+        UseStructuredContent = true)]
+    [Description("Permanently deletes a retained MySQL watch session and all transactions captured by it. If the watch is active, it is stopped before deletion. The watchId cannot be queried after deletion.")]
+    public static string DeleteMysqlWatch(
+        WatchSessionManager manager,
+        [Description("Watch identifier returned by start_mysql_watch.")] string watchId)
+    {
+        Invoke(() => manager.Delete(watchId));
+        return watchId;
+    }
+
     private static T Invoke<T>(Func<T> action)
     {
         try
         {
             return action();
+        }
+        catch (WatchException exception)
+        {
+            throw new McpException(exception.Message, exception);
+        }
+    }
+
+    private static void Invoke(Action action)
+    {
+        try
+        {
+            action();
         }
         catch (WatchException exception)
         {

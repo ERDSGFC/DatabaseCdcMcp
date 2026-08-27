@@ -44,6 +44,11 @@ public sealed record WatchStatusResponse(
     [property: Description("Listener error message when state is faulted; otherwise null.")]
     string? Error);
 
+[Description("All MySQL watch sessions currently retained in memory, including active and finished sessions.")]
+public sealed record WatchSessionsResponse(
+    [property: Description("All retained watch session statuses, ordered by start time.")]
+    IReadOnlyList<WatchStatusResponse> Sessions);
+
 [Description("Database, table, and operation filters for an active MySQL watch.")]
 public sealed record WatchTargetResponse(
     [property: Description("Watch identifier returned by start_mysql_watch.")]

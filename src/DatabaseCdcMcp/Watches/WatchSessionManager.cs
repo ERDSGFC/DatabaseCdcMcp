@@ -126,6 +126,19 @@ public sealed class WatchSessionManager
     public WatchStatusResponse GetStatus(string watchId) => GetSession(watchId).GetStatus();
 
     /// <summary>
+    /// 返回当前进程中仍保留的所有监听会话，包括已结束会话。
+    /// </summary>
+    public WatchSessionsResponse GetAllSessions()
+    {
+        var sessions = _sessions.Values
+            .Select(session => session.GetStatus())
+            .OrderBy(status => status.StartedAt)
+            .ToArray();
+
+        return new WatchSessionsResponse(sessions);
+    }
+
+    /// <summary>
     /// 返回当前仍在运行的监听目标；已完成的监听不会出现在结果中。
     /// </summary>
     public WatchTargetsResponse GetCurrentTargets()
@@ -148,6 +161,20 @@ public sealed class WatchSessionManager
         var session = GetSession(watchId);
         session.RequestStop();
         return session.GetStatus();
+    }
+
+    /// <summary>
+    /// 删除指定会话及其已保存的事务数据。
+    /// </summary>
+    public void Delete(string watchId)
+    {
+        var session = GetSession(watchId);
+        session.RequestStop();
+
+        if (!_sessions.TryRemove(new KeyValuePair<string, WatchSession>(watchId, session)))
+        {
+            throw new WatchException("The requested watch session could not be deleted.");
+        }
     }
 
     private async Task RunSessionLifetimeAsync(WatchSession session)
